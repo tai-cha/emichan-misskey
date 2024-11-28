@@ -65,6 +65,8 @@ async function create():Promise<string | null> {
     return createTextFromInputs(texts)
 }
 
+//ここから実行
+
 (async ()=>{
   let text = await retry(create, {
               retries: 3,

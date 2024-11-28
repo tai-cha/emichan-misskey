@@ -1,7 +1,6 @@
 import * as mfm from 'mfm-js'
 import { isMfmBlock } from 'mfm-js/built/node.js';
-import { wakatiSync } from "@enjoyjs/node-mecab"
-import { isStringArray } from '@/utils/type_checker.js';
+import { tokenizeSync } from "@enjoyjs/node-mecab"
 import Config from '@/utils/config.js'
 
 // load env
@@ -41,7 +40,9 @@ function sanitizeLoop<T extends mfm.MfmNode['type'], N extends mfm.NodeType<T>>(
     return []
   }
 
-  if (node.children && node.children.length > 0 && isMfmNodeArray(node.children) ) {
+  if (['url', 'mention', 'hashtag', 'link'].includes(node.type)) {
+    return []
+  } else if (node.children && node.children.length > 0 && isMfmNodeArray(node.children) ) {
     let children:Array<N> = node.children
     return children.map(sanitizeLoop).flat()
   } else {
@@ -53,46 +54,51 @@ export function sanitize(nodes:Array<mfm.MfmNode>):Array<mfm.MfmNode> {
   return nodes.map(n => sanitizeLoop(n)).flat()
 }
 
-function tokenize(mfm:Array<mfm.MfmNode>):Array<string> {
-  let tokens:Array<string | undefined> = mfm.map(node => {
+type EmiToken = {
+  id: number | undefined,
+  surface: string,
+  feature: {
+    pos: string,
+    [key: string]: any
+  },
+  [key: string]: any
+}
+
+function tokenize(mfm:Array<mfm.MfmNode>):Array<EmiToken> {
+  let tokens:Array<EmiToken> = mfm.map(node => {
     if (node.type == 'text') {
       let options = {}
       if (Config.mecabDicDir) options = {...options, dicdir: Config.mecabDicDir}
-      return wakatiSync(node.props.text, options).flat()
+      return tokenizeSync(node.props.text, options).flat() as unknown as EmiToken[]
     }
     if (node.type == 'unicodeEmoji') {
-      return node.props.emoji
+      return { surface: node.props.emoji, feature: { pos: '絵文字' }} as EmiToken
     }
     if (node.type == 'emojiCode') {
-      return `:${node.props.name}:`
+      return { surface: `:${node.props.name}:`, feature: { pos: '絵文字' }} as EmiToken
     }
-  }).flat()
-  if (tokens.length > 0 && tokens[0] === '') {
+  }).flat().filter((t) : t is EmiToken => t !== undefined)
+  if (tokens.length > 0 && tokens[0]?.surface === '') {
     tokens = tokens.slice(1)
   }
-  tokens = tokens.map(t => t === '' ? "\n" : t)
-  if (isStringArray(tokens)) {
-    return tokens
-  } else {
-    return []
-  }
+  return tokens
 }
 
-function createTokenChunk(tokens: Array<string>):Array<Array<string>> {
+function createTokenChunk(tokens: Array<EmiToken>):Array<Array<EmiToken>> {
   if (!tokens || tokens.length <= 0) return []
   if (tokens.length < CHUNK_SIZE) return [[...tokens]]
-  let lines:Array<Array<string>> = [[]]
+  let lines:Array<Array<EmiToken>> = [[]]
   tokens.forEach((t)=> {
     const lastIdx = lines.length - 1
     lines[lastIdx].push(t)
-    if (endLetters.includes(t)) {
+    if (endLetters.includes(t.surface)) {
       lines.push([])
     }
   })
-  let chunks:Array<Array<string>> = []
+  let chunks:Array<Array<EmiToken>> = []
   lines.forEach(line=>{
     line.forEach((token, i, arr) =>{
-      if (i > arr.length - CHUNK_SIZE && token === "\n") return
+      if (i > arr.length - CHUNK_SIZE && token.surface === "\n") return
       let res = arr.slice(i, i + CHUNK_SIZE)
       chunks.push(res)
     })
@@ -101,20 +107,24 @@ function createTokenChunk(tokens: Array<string>):Array<Array<string>> {
   return chunks
 }
 
-function selectChunk(chunks:Array<Array<string>>, start:Array<string>):Array<string> {
-  let matched = chunks.filter(chunk => start.every((el, i) => chunk?.[i] === el)).filter(chunk => chunk.length !== start.length)
-  if (matched.length === 0) return ['\n']
+function selectChunk(chunks:Array<Array<EmiToken>>, start:Array<EmiToken>):Array<EmiToken> {
+  let matched = chunks.filter(chunk => start.every((el, i) => chunk?.[i].surface === el.surface)).filter(chunk => chunk.length !== start.length)
+  if (matched.length === 0) return [{ surface: "\n", feature: 
+    {pos: "なに"} } as EmiToken]
   let selectedIdx = Math.floor(Math.random() * matched.length)
 
   return matched[selectedIdx]
 }
 
-function createResultChunk(chunks:Array<Array<string>>, start: Array<string>) {
-  let result:Array<[number, Array<string>]> = [[0, start]]
+function createResultChunk(chunks:Array<Array<EmiToken>>) {
+  const startCandidates = chunks.filter((chunk) => (chunk.length > 1 && chunk[0]?.surface === "BOS" && chunk[0]?.feature.pos === "BOS/EOS") && !['助詞'].includes(chunk[1].feature.pos))
+
+  const start = startCandidates[Math.floor(Math.random() * startCandidates.length)]
+  let result:Array<[number, Array<EmiToken>]> = [[0, start]]
 
   let cnt = 0
   // cnt条件未満または最後のチャンクの最後のトークンが指定された文字列でないとき
-  while(cnt < 50 && !['。'].includes(result?.slice(-1)?.[0]?.[1]?.slice(-1)?.[0])) {
+  while(cnt < 50 && !['。', "EOS"].includes(result?.slice(-1)?.[0]?.[1]?.slice(-1)?.[0].surface)) {
     const this_match_length = match_length()
     if (result.length > 0) {
       const lastChunk = result[result.length - 1]
@@ -128,20 +138,25 @@ function createResultChunk(chunks:Array<Array<string>>, start: Array<string>) {
   return result
 }
 
-function chunkToString(chunks:Array<[number, Array<string>]>):string {
+function chunkToString(chunks:Array<[number, Array<EmiToken>]>):string {
   if (chunks.length < 1) return ''
 
   let _chunks = chunks.map((chunk) => {
     return chunk[1].map((word, i, words) => {
       if ( i <= chunk[0] - 1 ) return ''
-      if (words?.[i-1]?.match(emojiRegex) && word.match(/^[0-9A-z]+.*/)) {
-        return `𝅳${word}`
+
+      if (word.feature.pos === 'BOS/EOS') {
+        if (words?.[i-1]?.surface === 'EOS' && word.surface === 'BOS') return "\n"
+        else return ''
       }
-      if (words?.[i-1]?.match(/^[0-9A-z.!]{2,}/) && word.match(/^[0-9A-z.!]+/)) {
+      if (words?.[i-1]?.surface.match(emojiRegex) && word.surface.match(/^[0-9A-z]+.*/)) {
+        return `𝅳${word.surface}`
+      }
+      if (words?.[i-1]?.surface.match(/^[0-9A-z.!]{2,}/) && word.surface.match(/^[0-9A-z.!]+/)) {
         // English
-        return ` ${word}`
+        return ` ${word.surface}`
       }
-      return word
+      return word.surface
     })
   })
 
@@ -165,20 +180,20 @@ export function createTextFromInputs(textInputs: Array<string>) {
   const chunks = textInputs.filter(i => !i.match(/^[0-9A-z\n ]+$/)).map(txt => createChunksFromInput(txt))
   let result:string = ''
   let needs_retry = true
+  const minimum = 1 + Math.floor(Math.random() * 7)
   const retry_condition = () => {
     return result === '' ||
     !assertPairBrackets(result) ||
     needs_retry ||
-    result.length < 5
+    result.length < 5 ||
+    createChunksFromInput(result).length < minimum
   }
 
   while(retry_condition()){
-    let startTarget = chunks
-    let startWord = startTarget[Math.floor(Math.random() * startTarget.length)][0]
-
-    result = chunkToString(createResultChunk(chunks.flat(1), startWord))
-    let same = textInputs.find((i) => i.includes(result || ''))
+    result = chunkToString(createResultChunk(chunks.flat(1)))
+    let same = textInputs.find(i => i === result)
     if (same == undefined) needs_retry = false
+    else console.debug('同じ文章が生成されたため再試行します。')
   }
   return result
 }
