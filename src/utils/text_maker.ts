@@ -7,8 +7,10 @@ import Config from '@/utils/config.js'
 Config
 
 const CHUNK_SIZE = 2
+const MIN_CHUNK_LENGTH = 3
 const MAX_MATCH_LENGTH = 4
-const TERMINATION_PROBABILITY = 0.7
+const TERMINATION_PROBABILITY = 0.5
+const NOUN_TERMINATION_RATIO = 1.25
 const emojiRegex = /:[0-9A-z_\-]+:/
 const endLetters = ["\n", "。", "　"]
 
@@ -132,7 +134,18 @@ function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): Ar
   }
 
   // Tier 2: 確率的終了判定 (長さの厳格な制御)
-  if (start.length > 0 && Math.random() < TERMINATION_PROBABILITY) {
+  // 助詞や接続詞で終わるのは不自然なので避ける
+  const lastToken = start[start.length - 1]
+  const lastPos = lastToken?.feature.pos
+  const isBadEndPos = ['助詞', '接続詞'].includes(lastPos)
+  const isNounEnd = lastPos === '名詞'
+
+  // 名詞の場合は終了確率を上げる (相対値)、それ以外はデフォルト
+  const threshold = isNounEnd
+    ? Math.min(1, TERMINATION_PROBABILITY * NOUN_TERMINATION_RATIO)
+    : TERMINATION_PROBABILITY
+
+  if (start.length > 0 && !isBadEndPos && Math.random() < threshold) {
     return [{ surface: "\n", feature: { pos: "EOS" } } as EmiToken]
   }
 
@@ -140,7 +153,16 @@ function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): Ar
   if (start.length > 0) {
     // チャンクの最初の単語の品詞が、BOS/EOSでないものを抽出
     let matched_pos = chunks.filter(chunk => {
-      return chunk.length > 0 && chunk[0].feature.pos !== 'BOS/EOS'
+      if (chunk.length <= 0) return false
+      const firstPos = chunk[0].feature.pos
+      if (firstPos === 'BOS/EOS') return false
+
+      // 不自然な繋がりを避ける
+      const lastToken = start[start.length - 1]
+      const lastPos = lastToken?.feature.pos
+      if (lastPos === '助詞' && firstPos === '助詞') return false
+
+      return true
     }).filter(chunk => chunk.length !== start.length)
 
     if (matched_pos.length > 0) {
@@ -218,7 +240,7 @@ export function createTextFromInputs(textInputs: Array<string>) {
   const chunks = textInputs.filter(i => !i.match(/^[0-9A-z\n ]+$/)).map(txt => createChunksFromInput(txt))
   let result: string = ''
   let needs_retry = true
-  const minimum = 1 + Math.floor(Math.random() * 7)
+  const minimum = MIN_CHUNK_LENGTH + Math.floor(Math.random() * 5)
   const retry_condition = () => {
     return result === '' ||
       !assertPairBrackets(result) ||
