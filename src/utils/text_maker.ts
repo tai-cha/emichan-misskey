@@ -65,7 +65,7 @@ type EmiToken = {
   [key: string]: any
 }
 
-function tokenize(mfm: Array<mfm.MfmNode>): Array<EmiToken> {
+export function tokenize(mfm: Array<mfm.MfmNode>): Array<EmiToken> {
   let tokens: Array<EmiToken> = mfm.map(node => {
     if (node.type == 'text') {
       let options = {}
@@ -82,6 +82,17 @@ function tokenize(mfm: Array<mfm.MfmNode>): Array<EmiToken> {
   if (tokens.length > 0 && tokens[0]?.surface === '') {
     tokens = tokens.slice(1)
   }
+
+  // MeCabの設定によってはBOS/EOSが付与されないため、強制的に付与する
+  if (tokens.length > 0) {
+    if (tokens[0].surface !== 'BOS') {
+      tokens.unshift({ surface: 'BOS', feature: { pos: 'BOS/EOS' }, id: undefined })
+    }
+    if (tokens[tokens.length - 1].surface !== 'EOS') {
+      tokens.push({ surface: 'EOS', feature: { pos: 'BOS/EOS' }, id: undefined })
+    }
+  }
+
   return tokens
 }
 
@@ -146,6 +157,7 @@ function createResultChunk(chunks: Array<Array<EmiToken>>) {
   const startCandidates = chunks.filter((chunk) => (chunk.length > 1 && chunk[0]?.surface === "BOS" && chunk[0]?.feature.pos === "BOS/EOS") && !['助詞'].includes(chunk[1].feature.pos))
 
   const start = startCandidates[Math.floor(Math.random() * startCandidates.length)]
+  if (!start) return []
   let result: Array<[number, Array<EmiToken>]> = [[0, start]]
 
   let cnt = 0
@@ -215,7 +227,13 @@ export function createTextFromInputs(textInputs: Array<string>) {
       createChunksFromInput(result).length < minimum
   }
 
+  let retry_count = 0
   while (retry_condition()) {
+    if (retry_count > 100) {
+      console.warn('Text generation retry limit exceeded.')
+      return ''
+    }
+    retry_count += 1
     result = chunkToString(createResultChunk(chunks.flat(1)))
     let same = textInputs.find(i => i === result)
     if (same == undefined) needs_retry = false
