@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, isJapaneseSentence, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -95,6 +95,40 @@ describe('text_maker', () => {
     it('should return empty arrays for empty input', () => {
       expect(tokenizeMany([])).toEqual([])
       expect(tokenizeMany([sanitize(mfm.parse(''))])).toEqual([[]])
+    });
+  });
+
+  describe('isJapaneseSentence', () => {
+    const judge = (text: string) => isJapaneseSentence(tokenize(sanitize(mfm.parse(text))))
+
+    it.each([
+      '今日はいい天気',
+      'Windows 11の更新が来た',
+      ':blobcat_tea:',
+      ':meow_yikes::uwa_txu:',
+      '😇',
+      '(´・ω・`)',
+      '(´Д`)',
+      '(ㅤ´ ꒳ `)ㅤㅤ:tegaki_blobcat_tatenori:',
+      '━━━',
+    ])('should keep Japanese, emoji-only and kaomoji sentences: %s', text => {
+      expect(judge(text)).toBe(true)
+    });
+
+    it.each([
+      'Les chiens sont des animaux de compagnie.',
+      'Get Wild :leaving_work:',
+      'ꔒꖸꔎꖏꕿꕌꔅꕿꔎꔒꖕꖏꕿꕩՆ',
+      'O-oooooooooo AAAAE-A-A-I-A-U-',
+      '1259',
+    ])('should drop sentences without Japanese that contain words: %s', text => {
+      expect(judge(text)).toBe(false)
+    });
+
+    it('buildCorpus should drop only non-Japanese lines from a note', () => {
+      const corpus = buildCorpus(['今日はいい天気\nThis is English\n:blobcat_tea:'])
+      const lines = corpus.map(s => s.filter(t => t.feature.pos !== 'BOS/EOS').map(t => t.surface).join(''))
+      expect(lines).toEqual(['今日はいい天気', ':blobcat_tea:'])
     });
   });
 

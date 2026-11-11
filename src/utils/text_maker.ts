@@ -292,11 +292,26 @@ export class NgramModel {
   }
 }
 
+const JAPANESE_CHARS = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u
+// 2文字以上続く文字・数字 (単語)。顔文字の ω や Д のような1文字は含まない
+const NON_JAPANESE_WORD = /[\p{L}\p{N}]{2,}/u
+// 顔文字などで空白として使われる見えない文字 (ハングルの埋め字など)
+const INVISIBLE_FILLERS = /[\u115F\u1160\u3164\uFFA0\u200B]/gu
+
+// 日本語の文、または絵文字・記号・顔文字だけの文なら true
+// 日本語を含まず単語を含む文(外国語の文、文字遊び、数字だけの行など)は false
+export function isJapaneseSentence(sentence: Array<EmiToken>): boolean {
+  const text = sentence
+    .filter(t => !isBoundary(t) && !isGap(t) && t.feature.pos !== '絵文字')
+    .map(t => t.surface)
+    .join(' ')
+    .replace(INVISIBLE_FILLERS, '')
+  return JAPANESE_CHARS.test(text) || !NON_JAPANESE_WORD.test(text)
+}
+
 export function buildCorpus(textInputs: Array<string>): Array<Array<EmiToken>> {
-  const documents = textInputs
-    .filter(i => !i.match(/^[0-9A-z\n ]+$/))
-    .map(txt => sanitize(mfm.parse(txt)))
-  return tokenizeMany(documents).flatMap(splitSentences)
+  const documents = textInputs.map(txt => sanitize(mfm.parse(txt)))
+  return tokenizeMany(documents).flatMap(splitSentences).filter(isJapaneseSentence)
 }
 
 export function buildModel(textInputs: Array<string>): NgramModel {
