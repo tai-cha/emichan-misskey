@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -58,6 +58,43 @@ describe('text_maker', () => {
 
     it('should split sentences only at line breaks and skip empty lines', () => {
       expect(surfaces('猫\n\n犬')).toEqual(['BOS', '猫', 'EOS', 'BOS', '犬', 'EOS'])
+    });
+  });
+
+  describe('tokenizeMany', () => {
+    const texts = [
+      '今日はいい天気ですね。\n明日は雨',
+      'おはよう:wave:みんな',
+      '',
+      '今日は #猫の日 だよ\n\n\n最後の行',
+      'Windowsの改行\r\n次の行',
+      '「括弧」の中',
+    ]
+    const docs = texts.map(t => sanitize(mfm.parse(t)))
+    const norm = (tokens: EmiToken[]) => tokens.map(t => [t.surface, t.feature])
+
+    it('should give the same result as tokenizing each document separately', () => {
+      const batched = tokenizeMany(docs)
+      expect(batched).toHaveLength(docs.length)
+      docs.forEach((doc, i) => expect(norm(batched[i])).toEqual(norm(tokenize(doc))))
+    });
+
+    it('should not be affected by neighboring documents', () => {
+      // 前後の文書の有無で解析結果が変わらないこと
+      const alone = tokenizeMany([docs[0]])[0]
+      const withOthers = tokenizeMany([docs[5], docs[0], docs[1]])[1]
+      expect(norm(withOthers)).toEqual(norm(alone))
+    });
+
+    it('should handle CRLF line breaks', () => {
+      const surfaces = tokenizeMany([docs[4]])[0].map(t => t.surface)
+      expect(surfaces.filter(s => s === 'BOS')).toHaveLength(2)
+      expect(surfaces.some(s => s.includes('\r'))).toBe(false)
+    });
+
+    it('should return empty arrays for empty input', () => {
+      expect(tokenizeMany([])).toEqual([])
+      expect(tokenizeMany([sanitize(mfm.parse(''))])).toEqual([[]])
     });
   });
 

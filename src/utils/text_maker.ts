@@ -116,28 +116,51 @@ function trimGaps(line: Array<EmiToken>): Array<EmiToken> {
   return result
 }
 
-function mecab(text: string): Array<EmiToken> {
+// 複数のテキストをまとめて1回のMeCab呼び出しで解析する (呼び出しごとにプロセスが起動するため)
+// MeCabは入力を1行ずつ独立に解析するので、改行を含まないテキストを改行で連結しても結果は変わらない
+function mecabBatch(texts: Array<string>): Array<Array<EmiToken>> {
+  if (texts.length === 0) return []
+  if (texts.some(t => /[\r\n]/.test(t))) throw new Error('mecabBatch: text must not contain line breaks')
   let options = {}
   if (Config.mecabDicDir) options = { ...options, dicdir: Config.mecabDicDir }
-  // MeCabが付与するBOS/EOSは除き、文の区切りはtokenize側で管理する
-  return (tokenizeSync(text, options).flat() as unknown as EmiToken[])
-    .filter(t => !isBoundary(t) && t.surface !== '')
+  const raw = tokenizeSync(texts.join('\n'), options) as unknown as EmiToken[]
+
+  // 出力は1行ごとに BOS ... EOS で区切られている
+  const results: Array<Array<EmiToken>> = []
+  let current: Array<EmiToken> | null = null
+  for (const t of raw) {
+    if (isBOS(t)) current = []
+    else if (isEOS(t)) {
+      if (current) results.push(current)
+      current = null
+    } else if (current && t.surface !== '') current.push(t)
+  }
+  if (results.length !== texts.length) {
+    throw new Error(`mecabBatch: expected ${texts.length} results but got ${results.length}`)
+  }
+  return results
 }
 
-// 改行ごとに BOS ... EOS で囲んだトークン列を返す
-// MFMノードの境界では文を区切らず、連続するテキストはまとめて解析する
-// 除去された要素の位置には GAP トークンが入る
-export function tokenize(nodes: Array<SanitizedNode>): Array<EmiToken> {
-  const lines: Array<Array<EmiToken>> = [[]]
+// 解析待ちのテキスト断片の位置を示す
+type Pending = { pending: number }
+type Line = Array<EmiToken | Pending>
+
+// 改行ごとに区切った行を作る。MeCabで解析するテキスト断片は segments に追加し、その位置を Pending で示す
+// MFMノードの境界では文を区切らず、連続するテキストはまとめて1つの断片にする
+function splitLines(nodes: Array<SanitizedNode>, segments: Array<string>): Array<Line> {
+  const lines: Array<Line> = [[]]
   let buffer = ''
   const flush = () => {
-    if (buffer.trim() !== '') lines[lines.length - 1].push(...mecab(buffer))
+    if (buffer.trim() !== '') {
+      lines[lines.length - 1].push({ pending: segments.length })
+      segments.push(buffer)
+    }
     buffer = ''
   }
 
   for (const node of nodes) {
     if (node.type == 'text') {
-      node.props.text.split('\n').forEach((part, i) => {
+      node.props.text.split(/\r?\n/).forEach((part, i) => {
         if (i > 0) {
           flush()
           lines.push([])
@@ -156,8 +179,24 @@ export function tokenize(nodes: Array<SanitizedNode>): Array<EmiToken> {
     }
   }
   flush()
+  return lines
+}
 
-  return lines.map(trimGaps).filter(line => line.length > 0).flatMap(line => [BOS_TOKEN, ...line, EOS_TOKEN])
+// 複数の文章をまとめて解析し、それぞれ改行ごとに BOS ... EOS で囲んだトークン列を返す
+// 除去された要素の位置には GAP トークンが入る
+export function tokenizeMany(documents: Array<Array<SanitizedNode>>): Array<Array<EmiToken>> {
+  const segments: Array<string> = []
+  const documentLines = documents.map(nodes => splitLines(nodes, segments))
+  const analyzed = mecabBatch(segments)
+
+  return documentLines.map(lines => lines
+    .map(line => trimGaps(line.flatMap(item => 'pending' in item ? analyzed[item.pending] : [item])))
+    .filter(line => line.length > 0)
+    .flatMap(line => [BOS_TOKEN, ...line, EOS_TOKEN]))
+}
+
+export function tokenize(nodes: Array<SanitizedNode>): Array<EmiToken> {
+  return tokenizeMany([nodes])[0]
 }
 
 // BOS ... EOS 単位に分割する
@@ -254,9 +293,10 @@ export class NgramModel {
 }
 
 export function buildCorpus(textInputs: Array<string>): Array<Array<EmiToken>> {
-  return textInputs
+  const documents = textInputs
     .filter(i => !i.match(/^[0-9A-z\n ]+$/))
-    .flatMap(txt => splitSentences(tokenize(sanitize(mfm.parse(txt)))))
+    .map(txt => sanitize(mfm.parse(txt)))
+  return tokenizeMany(documents).flatMap(splitSentences)
 }
 
 export function buildModel(textInputs: Array<string>): NgramModel {
