@@ -480,6 +480,12 @@ export function scoreCandidate(model: NgramModel, tokens: Array<EmiToken>, copyR
     - LENGTH_PENALTY * Math.max(0, Math.log(wordCountOf(tokens) / lengthLimit))
 }
 
+// カスタム絵文字・Unicode絵文字だけでできた文なら true
+export function isEmojiOnly(tokens: Array<EmiToken>): boolean {
+  const words = tokens.filter(t => !isBoundary(t) && !isGap(t))
+  return words.length > 0 && words.every(t => t.feature.pos === '絵文字')
+}
+
 export function createTextFromInputs(textInputs: Array<string>) {
   const sentences = buildCorpus(textInputs)
   const model = new NgramModel()
@@ -488,27 +494,41 @@ export function createTextFromInputs(textInputs: Array<string>) {
   const lengthLimit = lengthLimitOf(sentences)
   const minimum = MIN_TOKEN_LENGTH + Math.floor(Math.random() * 5)
 
-  const candidates = new Map<string, { item: string, score: number }>()
+  // 絵文字だけの投稿は、TL中で絵文字だけの文が占める割合と同じ確率で選ぶ
+  // (平均対数尤度は文頭の確率の影響が大きく、短い絵文字だけの文はスコアで普通の文に勝てないため別枠にする)
+  const emojiOnlyRate = sentences.length > 0 ? sentences.filter(isEmojiOnly).length / sentences.length : 0
+
+  const candidates = new Map<string, { item: string, score: number, emojiOnly: boolean }>()
   for (let attempt = 0; attempt < MAX_ATTEMPTS && candidates.size < CANDIDATE_COUNT; attempt++) {
     const tokens = generate(model)
     if (!tokens) continue
     const result = tokensToString(tokens)
     const wordCount = tokens.filter(t => !isBoundary(t)).length
-    if (result.length < 5 || wordCount < minimum || !isBalanced(result)) continue
-    if (candidates.has(result)) continue
-    const copyRatio = copyDetector.copyRatio(tokens)
+    const emojiOnly = isEmojiOnly(tokens)
+    // 絵文字だけの投稿は短くても成立するため、長さの条件を課さない
+    if (!emojiOnly && (result.length < 5 || wordCount < minimum)) continue
+    if (!isBalanced(result) || candidates.has(result)) continue
+    // 絵文字1つだけの投稿は、元の投稿と同じでも丸写しとはみなさない
+    const singleEmoji = emojiOnly && wordCount === 1
+    const copyRatio = singleEmoji ? 0 : copyDetector.copyRatio(tokens)
     // 入力そのもの、または元の1文の一部をそのまま切り出しただけの文は候補にしない
-    if (textInputs.includes(result) || copyRatio >= 1) continue
-    candidates.set(result, { item: result, score: scoreCandidate(model, tokens, copyRatio, lengthLimit) })
+    if (!singleEmoji && (textInputs.includes(result) || copyRatio >= 1)) continue
+    candidates.set(result, { item: result, score: scoreCandidate(model, tokens, copyRatio, lengthLimit), emojiOnly })
   }
 
   if (candidates.size === 0) {
     console.warn('Text generation retry limit exceeded.')
     return ''
   }
-  const ranked = [...candidates.values()].sort((a, b) => b.score - a.score)
+  const all = [...candidates.values()]
+  const emojiCandidates = all.filter(c => c.emojiOnly)
+  const textCandidates = all.filter(c => !c.emojiOnly)
+  const useEmoji = emojiCandidates.length > 0 && (textCandidates.length === 0 || Math.random() < emojiOnlyRate)
+
+  const ranked = (useEmoji ? emojiCandidates : textCandidates).sort((a, b) => b.score - a.score)
   const result = pickBySoftmax(ranked, SELECTION_TEMPERATURE)
   const rank = ranked.findIndex(c => c.item === result)
-  console.debug(`候補${ranked.length}件中${rank + 1}位を採用 (score: ${ranked[rank].score.toFixed(2)})`)
+  const kind = useEmoji ? '絵文字だけの候補' : '候補'
+  console.debug(`${kind}${ranked.length}件中${rank + 1}位を採用 (score: ${ranked[rank].score.toFixed(2)})`)
   return result
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, isJapaneseSentence, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, isJapaneseSentence, isEmojiOnly, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -389,6 +389,36 @@ describe('text_maker', () => {
         // 入力の一部をそのまま切り出しただけの文は採用されない
         expect(inputs.some(input => input.includes(result)), result).toBe(false);
       }
+    });
+
+    it('isEmojiOnly should detect sentences made only of emojis', () => {
+      const judge = (text: string) => isEmojiOnly(tokenize(sanitize(mfm.parse(text))))
+      expect(judge(':blobcat_tea:')).toBe(true)
+      expect(judge(':meow_yikes:😇:uwa_txu:')).toBe(true)
+      expect(judge('おはよう:wave:')).toBe(false)
+      expect(judge('(´・ω・`)')).toBe(false)
+    });
+
+    it('should allow single-emoji posts even if they are the same as an input', () => {
+      // 入力がすべて絵文字1つだけなら、短さや丸写しで弾かれずにそのいずれかが選ばれる
+      const inputs = [':blobcat_tea:', ':meow_snapped:', '😇']
+      for (let i = 0; i < 10; i++) {
+        expect(inputs).toContain(createTextFromInputs(inputs))
+      }
+    });
+
+    it('should post emoji-only text about as often as emoji-only lines appear in inputs', () => {
+      const text = ['今日はとてもいい天気ですね。', '散歩していたら、可愛い猫を見つけました。', '雨の日は家でゆっくり読書をするのが好きです。', '猫はこたつで丸くなって寝ていました。']
+      const emoji = [':blobcat_tea:', ':meow_snapped:', '😇', ':leaving_work:']
+      const isEmojiText = (t: string) => /^(:[0-9A-Za-z_\-]+:|\p{Extended_Pictographic})+$/u.test(t)
+      vi.spyOn(console, 'debug').mockImplementation(() => {})
+      // 文の半分が絵文字だけなので、およそ半分が絵文字だけの投稿になる
+      const outputs = Array.from({ length: 200 }, () => createTextFromInputs([...text, ...emoji]))
+      const rate = outputs.filter(isEmojiText).length / outputs.length
+      expect(rate).toBeGreaterThan(0.3)
+      expect(rate).toBeLessThan(0.7)
+      // 文章だけの入力からは絵文字だけの投稿は出ない
+      expect(Array.from({ length: 20 }, () => createTextFromInputs(text)).some(isEmojiText)).toBe(false)
     });
 
     it('should handle empty inputs gracefully', () => {
