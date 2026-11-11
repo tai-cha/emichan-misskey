@@ -6,9 +6,10 @@ import Config from '@/utils/config.js'
 // load env
 Config
 
-const CHUNK_SIZE = 2
-const MIN_CHUNK_LENGTH = 3
 const MAX_MATCH_LENGTH = 4
+// 最大マッチ長 + 次の1トークン分を保持できる長さが必要
+const CHUNK_SIZE = MAX_MATCH_LENGTH + 1
+const MIN_CHUNK_LENGTH = 3
 const TERMINATION_PROBABILITY = 0.5
 const NOUN_TERMINATION_RATIO = 1.25
 const emojiRegex = /:[0-9A-z_\-]+:/
@@ -121,16 +122,23 @@ function createTokenChunk(tokens: Array<EmiToken>): Array<Array<EmiToken>> {
   return chunks
 }
 
-function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): Array<EmiToken> {
-  // Tier 1: Surface Match (流暢さ最優先)
-  let matched_surface = chunks.filter(chunk =>
-    start.every((el, i) => chunk?.[i]?.surface === el.surface)
-  ).filter(chunk => chunk.length !== start.length)
+const EOS_TOKEN: EmiToken = { surface: "EOS", feature: { pos: "BOS/EOS" }, id: undefined }
 
-  if (matched_surface.length > 0) {
-    // 成功: 頻度無視の均等選択
-    let selectedIdx = Math.floor(Math.random() * matched_surface.length)
-    return matched_surface[selectedIdx]
+// 戻り値: [マッチに使ったトークン数, チャンク]。チャンクの先頭からマッチ数分は既出なので出力されない
+function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): [number, Array<EmiToken>] {
+  // Tier 1: Surface Match (流暢さ最優先)
+  // 長い文脈から順に試し、見つからなければ短い文脈にバックオフする
+  for (let len = start.length; len >= 1; len--) {
+    const context = start.slice(-len)
+    const matched_surface = chunks.filter(chunk =>
+      chunk.length > len && context.every((el, i) => chunk[i].surface === el.surface)
+    )
+    if (matched_surface.length > 0) {
+      // 重複するチャンクも候補に含まれるため、出現頻度に比例した選択になる
+      const selected = matched_surface[Math.floor(Math.random() * matched_surface.length)]
+      // 次の1トークンだけを採用する
+      return [len, selected.slice(0, len + 1)]
+    }
   }
 
   // Tier 2: 確率的終了判定 (長さの厳格な制御)
@@ -146,7 +154,7 @@ function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): Ar
     : TERMINATION_PROBABILITY
 
   if (start.length > 0 && !isBadEndPos && Math.random() < threshold) {
-    return [{ surface: "\n", feature: { pos: "EOS" } } as EmiToken]
+    return [0, [EOS_TOKEN]]
   }
 
   // Tier 3: 品詞フォールバック (文法的な安全ネット)
@@ -167,12 +175,13 @@ function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): Ar
 
     if (matched_pos.length > 0) {
       let selectedIdx = Math.floor(Math.random() * matched_pos.length)
-      return matched_pos[selectedIdx]
+      // 文脈とは繋がらないため、チャンク全体を新しく出力する
+      return [0, matched_pos[selectedIdx]]
     }
   }
 
   // Tier 4: 最終フォールバック（破綻終了）
-  return [{ surface: "\n", feature: { pos: "EOS" } } as EmiToken]
+  return [0, [EOS_TOKEN]]
 }
 
 function createResultChunk(chunks: Array<Array<EmiToken>>) {
@@ -180,20 +189,19 @@ function createResultChunk(chunks: Array<Array<EmiToken>>) {
 
   const start = startCandidates[Math.floor(Math.random() * startCandidates.length)]
   if (!start) return []
-  let result: Array<[number, Array<EmiToken>]> = [[0, start]]
+  // 開始時は BOS + 最初の1トークンのみ採用する
+  let result: Array<[number, Array<EmiToken>]> = [[0, start.slice(0, 2)]]
+  // 文脈は直前のチャンクではなく、これまでに生成した(出力された)トークン列から取る
+  let generated: Array<EmiToken> = start.slice(0, 2)
 
   let cnt = 0
-  // cnt条件未満または最後のチャンクの最後のトークンが指定された文字列でないとき
-  while (cnt < 50 && !['。', "EOS"].includes(result?.slice(-1)?.[0]?.[1]?.slice(-1)?.[0].surface)) {
+  // cnt条件未満または生成した最後のトークンが終端でないとき
+  while (cnt < 50 && !['。', "EOS"].includes(generated[generated.length - 1]?.surface)) {
     const this_match_length = match_length()
-    if (result.length > 0) {
-      const lastChunk = result[result.length - 1]
-      const lastWords = lastChunk[1].slice(-this_match_length)
-      let selected = selectChunk(chunks, lastWords)
-      result.push([this_match_length, selected])
-
-      cnt += 1
-    }
+    const [matched, selected] = selectChunk(chunks, generated.slice(-this_match_length))
+    result.push([matched, selected])
+    generated = generated.concat(selected.slice(matched))
+    cnt += 1
   }
   return result
 }
