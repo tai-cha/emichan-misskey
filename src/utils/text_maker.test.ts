@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, updateBrackets, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -172,6 +172,33 @@ describe('text_maker', () => {
         expect(tokens[tokens.length - 1].surface).toBe('EOS')
         tokens.slice(1).forEach((t, j) => expect(bigrams).toContain(`${tokens[j].surface} ${t.surface}`))
         expect(tokensToString(tokens)).not.toMatch(/BOS|EOS/)
+      }
+    });
+  });
+
+  describe('brackets', () => {
+    it.each([
+      ['「あ」', []],
+      ['「『あ』', ['「']],
+      ['【(a)】', []],
+      ['「あ』', null],
+      ['あ）', null],
+      ['『「あ』」', null],
+    ])('updateBrackets(%s)', (text, expected) => {
+      expect(updateBrackets([], text)).toEqual(expected)
+    });
+
+    it('should never generate unbalanced brackets even from unbalanced inputs', () => {
+      vi.restoreAllMocks();
+      const inputs = [
+        '「明日やる」って言った', '「おはよう」って言われた', '『猫の日』を見た', '今日は雨」',
+        '映画『猫の日」を見た', '（小声）眠い', '眠い）', '【速報】雨が降ってきた', '「眠い',
+      ]
+      const model = buildModel(inputs)
+      for (let i = 0; i < 300; i++) {
+        const tokens = generate(model)
+        if (!tokens) continue
+        expect(updateBrackets([], tokensToString(tokens)), tokensToString(tokens)).toEqual([])
       }
     });
   });

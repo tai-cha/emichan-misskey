@@ -219,19 +219,47 @@ export function buildModel(textInputs: Array<string>): NgramModel {
   return model
 }
 
+const BRACKET_PAIRS = new Map([
+  ['「', '」'], ['『', '』'], ['【', '】'], ['（', '）'], ['［', '］'], ['｛', '｝'],
+  ['〈', '〉'], ['《', '》'], ['(', ')'], ['[', ']'], ['{', '}'],
+])
+const CLOSING_BRACKETS = new Map([...BRACKET_PAIRS].map(([open, close]) => [close, open]))
+
+// 未対応の開き括弧のスタックを text の分だけ進める。対応しない閉じ括弧があれば null
+export function updateBrackets(stack: ReadonlyArray<string>, text: string): Array<string> | null {
+  const next = [...stack]
+  for (const ch of text) {
+    if (BRACKET_PAIRS.has(ch)) {
+      next.push(ch)
+    } else if (CLOSING_BRACKETS.has(ch)) {
+      if (next[next.length - 1] !== CLOSING_BRACKETS.get(ch)) return null
+      next.pop()
+    }
+  }
+  return next
+}
+
+const isBalanced = (text: string) => updateBrackets([], text)?.length === 0
+
 // BOS から EOS まで生成する。終端に到達できなかった場合は null
 export function generate(model: NgramModel): Array<EmiToken> | null {
   const tokens: Array<EmiToken> = [BOS_TOKEN]
+  let brackets: Array<string> = []
+  // 閉じ括弧は対応する開き括弧があるときのみ、EOSは括弧がすべて閉じているときのみ許可する
+  const acceptBrackets = (t: EmiToken) => isEOS(t) ? brackets.length === 0 : updateBrackets(brackets, t.surface) !== null
+
   // 助詞から始まるのは不自然なので避ける
-  const first = model.next(tokens, t => t.feature.pos !== '助詞' && !isEOS(t))
+  const first = model.next(tokens, t => t.feature.pos !== '助詞' && !isEOS(t) && acceptBrackets(t))
   if (!first) return null
   tokens.push(first)
+  brackets = updateBrackets(brackets, first.surface)!
 
   while (tokens.length < MAX_TOKEN_LENGTH) {
-    const next = model.next(tokens.slice(-match_length()))
+    const next = model.next(tokens.slice(-match_length()), acceptBrackets)
     if (!next) return null
     tokens.push(next)
     if (isEOS(next)) return tokens
+    brackets = updateBrackets(brackets, next.surface)!
   }
   return null
 }
@@ -251,11 +279,6 @@ export function tokensToString(tokens: Array<EmiToken>): string {
   }).join('')
 }
 
-function assertPairBrackets(text: string): boolean {
-  const brackets: Array<string | [string, string] | [RegExp, RegExp]> = ['「」', '【】', [/\[/, /\]/], [/\(/, /\)/], '『』', '{}', '（）']
-  return brackets.every(bracket => [...text.matchAll(new RegExp(bracket[0], 'g'))].length === [...text.matchAll(new RegExp(bracket[1], 'g'))].length)
-}
-
 export function createTextFromInputs(textInputs: Array<string>) {
   const model = buildModel(textInputs)
   const minimum = MIN_TOKEN_LENGTH + Math.floor(Math.random() * 5)
@@ -265,7 +288,7 @@ export function createTextFromInputs(textInputs: Array<string>) {
     if (!tokens) continue
     const result = tokensToString(tokens)
     const wordCount = tokens.filter(t => !isBoundary(t)).length
-    if (result.length < 5 || wordCount < minimum || !assertPairBrackets(result)) continue
+    if (result.length < 5 || wordCount < minimum || !isBalanced(result)) continue
     if (textInputs.includes(result)) {
       console.debug('同じ文章が生成されたため再試行します。')
       continue
