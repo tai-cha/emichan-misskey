@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, isJapaneseSentence, isEmojiOnly, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, tokenizeMany, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, isJapaneseSentence, isEmojiOnly, updateReverseBrackets, generateAround, pickTopic, isTopicCandidate, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -354,6 +354,61 @@ describe('text_maker', () => {
       expect(warm.top).toBeGreaterThan(warm.mid)
       expect(warm.mid).toBeGreaterThan(warm.low)
       expect(warm.low).toBeGreaterThan(0)
+    });
+  });
+
+  describe('topic generation', () => {
+    it.each([
+      ['あ」', ['」']],
+      ['「あ」', []],
+      // 開き括弧だけなら前向き生成で閉じるので許可する
+      ['「あ', []],
+      ['「『あ』', []],
+      ['「あ』', null],
+    ])('updateReverseBrackets(%s)', (text, expected) => {
+      expect(updateReverseBrackets([], text)).toEqual(expected)
+    });
+
+    it.each([
+      ['猫', true], ['サーバー', true], ['東方Project', true], ['電話', true],
+      ['それ', false], ['今日', false], ['こと', false], ['2009年', false], ['さん', false],
+    ])('isTopicCandidate(%s) = %s', (word, expected) => {
+      const tokens = tokenize(sanitize(mfm.parse(`${word}がある`))).filter(t => t.feature.pos !== 'BOS/EOS')
+      expect(isTopicCandidate(tokens[0])).toBe(expected)
+    });
+
+    it('pickTopic should count each noun once per sentence', () => {
+      vi.restoreAllMocks();
+      // "猫" は1文に3回出るが1文として数え、"犬" は3文に出る
+      const sentences = buildCorpus(['猫と猫と猫', '犬がいる', '犬が走る', '犬と遊ぶ'])
+      const counts: Record<string, number> = {}
+      for (let i = 0; i < 2000; i++) {
+        const t = pickTopic(sentences)!.surface
+        counts[t] = (counts[t] ?? 0) + 1
+      }
+      expect(counts['犬'] / counts['猫']).toBeGreaterThan(2)
+      expect(counts['犬'] / counts['猫']).toBeLessThan(4.5)
+      expect(pickTopic(buildCorpus(['それはある']))).toBeNull()
+    });
+
+    it('generateAround should build a sentence around the topic using only learned transitions', () => {
+      vi.restoreAllMocks();
+      const inputs = ['今日は猫と遊んだ', '「猫が好き」と言った', '公園で猫を見つけた。', '明日は犬と遊ぶ']
+      const sentences = buildCorpus(inputs)
+      const forward = new NgramModel()
+      const backward = new NgramModel()
+      sentences.forEach(s => { forward.addSentence(s); backward.addSentence([...s].reverse()) })
+      const bigrams = new Set(sentences.flatMap(s => s.slice(1).map((t, i) => `${s[i].surface} ${t.surface}`)))
+      const seed = sentences[0].find(t => t.surface === '猫')!
+      for (let i = 0; i < 50; i++) {
+        const tokens = generateAround(forward, backward, seed)
+        if (!tokens) continue
+        expect(tokens[0].surface).toBe('BOS')
+        expect(tokens[tokens.length - 1].surface).toBe('EOS')
+        expect(tokens.map(t => t.surface)).toContain('猫')
+        tokens.slice(1).forEach((t, j) => expect(bigrams).toContain(`${tokens[j].surface} ${t.surface}`))
+        expect(updateBrackets([], tokensToString(tokens))).toEqual([])
+      }
     });
   });
 

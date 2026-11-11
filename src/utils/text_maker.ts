@@ -399,18 +399,39 @@ export function updateBrackets(stack: ReadonlyArray<string>, text: string): Arra
 
 const isBalanced = (text: string) => updateBrackets([], text)?.length === 0
 
-// BOS から EOS まで生成する。終端に到達できなかった場合は null
-export function generate(model: NgramModel): Array<EmiToken> | null {
-  const tokens: Array<EmiToken> = [BOS_TOKEN]
-  let brackets: Array<string> = []
-  // 閉じ括弧は対応する開き括弧があるときのみ、EOSは括弧がすべて閉じているときのみ許可する
-  const acceptBrackets = (t: EmiToken) => isEOS(t) ? brackets.length === 0 : updateBrackets(brackets, t.surface) !== null
+// 後ろ向き生成用。text を右から左へ読み、閉じ括弧を積む
+// 開き括弧は対応する閉じ括弧があれば取り除き、なければ前向き生成で閉じるものとして許可する。対応しない場合は null
+export function updateReverseBrackets(stack: ReadonlyArray<string>, text: string): Array<string> | null {
+  const next = [...stack]
+  for (const ch of [...text].reverse()) {
+    if (CLOSING_BRACKETS.has(ch)) {
+      next.push(ch)
+    } else if (BRACKET_PAIRS.has(ch)) {
+      if (next.length === 0) continue
+      if (BRACKET_PAIRS.get(ch) !== next[next.length - 1]) return null
+      next.pop()
+    }
+  }
+  return next
+}
 
-  // 助詞から始まるのは不自然なので避ける
-  const first = model.next(tokens, t => t.feature.pos !== '助詞' && !isEOS(t) && acceptBrackets(t))
-  if (!first) return null
-  tokens.push(first)
-  brackets = updateBrackets(brackets, first.surface)!
+const surfacesOf = (tokens: Array<EmiToken>) => tokens.filter(t => !isBoundary(t)).map(t => t.surface).join('')
+
+// prefix (BOS で始まる) の続きを EOS まで生成する。終端に到達できなかった場合は null
+function continueForward(model: NgramModel, prefix: Array<EmiToken>): Array<EmiToken> | null {
+  const tokens = [...prefix]
+  let brackets = updateBrackets([], surfacesOf(tokens))
+  if (!brackets) return null
+  // 閉じ括弧は対応する開き括弧があるときのみ、EOSは括弧がすべて閉じているときのみ許可する
+  const acceptBrackets = (t: EmiToken) => isEOS(t) ? brackets!.length === 0 : updateBrackets(brackets!, t.surface) !== null
+
+  if (tokens.length === 1) {
+    // 助詞から始まるのは不自然なので避ける
+    const first = model.next(tokens, t => t.feature.pos !== '助詞' && !isEOS(t) && acceptBrackets(t))
+    if (!first) return null
+    tokens.push(first)
+    brackets = updateBrackets(brackets, first.surface)!
+  }
 
   while (tokens.length < MAX_TOKEN_LENGTH) {
     const next = model.next(tokens.slice(-match_length()), acceptBrackets)
@@ -420,6 +441,64 @@ export function generate(model: NgramModel): Array<EmiToken> | null {
     brackets = updateBrackets(brackets, next.surface)!
   }
   return null
+}
+
+// BOS から EOS まで生成する。終端に到達できなかった場合は null
+export function generate(model: NgramModel): Array<EmiToken> | null {
+  return continueForward(model, [BOS_TOKEN])
+}
+
+// seed から後ろ向きに BOS まで生成し、それを文脈として前向きに EOS まで生成する
+// backward は文を逆順にして学習したモデル
+export function generateAround(forward: NgramModel, backward: NgramModel, seed: EmiToken): Array<EmiToken> | null {
+  // 逆順に並べたトークン列 (末尾が最も左のトークン)
+  const reversed: Array<EmiToken> = [seed]
+  let brackets = updateReverseBrackets([], seed.surface)
+  if (!brackets) return null
+
+  while (true) {
+    if (reversed.length >= MAX_TOKEN_LENGTH) return null
+    const stack = brackets
+    const leftmost = reversed[reversed.length - 1]
+    // BOSは括弧がすべて対応しているとき、かつ文頭が助詞にならないときのみ許可する
+    const accept = (t: EmiToken) => isBOS(t)
+      ? stack.length === 0 && leftmost.feature.pos !== '助詞'
+      : updateReverseBrackets(stack, t.surface) !== null
+    const prev = backward.next(reversed.slice(-match_length()), accept)
+    if (!prev) return null
+    reversed.push(prev)
+    if (isBOS(prev)) break
+    brackets = updateReverseBrackets(brackets, prev.surface)!
+  }
+  return continueForward(forward, reversed.reverse())
+}
+
+// 話題になりやすい名詞の種類 (代名詞・数・接尾・副詞可能・非自立などは除く)
+const TOPIC_NOUN_TYPES = ['一般', '固有名詞', 'サ変接続']
+
+export function isTopicCandidate(t: EmiToken): boolean {
+  return t.feature.pos === '名詞'
+    && TOPIC_NOUN_TYPES.includes(t.feature.posSubs?.[0])
+    // 1文字の名詞は漢字のみ (「猫」などは話題になるが、記号的な1文字は除く)
+    && (t.surface.length >= 2 || /^\p{Script=Han}$/u.test(t.surface))
+    // 「2009年」「35分」「98%」のような数字を含む語は話題になりにくい
+    && !/[\p{N}]/u.test(t.surface)
+}
+
+// その名詞を含む文の数に比例した確率で話題を選ぶ
+export function pickTopic(sentences: Array<Array<EmiToken>>): EmiToken | null {
+  const counts = new Map<string, { token: EmiToken, count: number }>()
+  for (const sentence of sentences) {
+    const seen = new Set<string>()
+    for (const t of sentence) {
+      if (!isTopicCandidate(t) || seen.has(t.surface)) continue
+      seen.add(t.surface)
+      const entry = counts.get(t.surface)
+      if (entry) entry.count += 1
+      else counts.set(t.surface, { token: t, count: 1 })
+    }
+  }
+  return counts.size > 0 ? weightedPick([...counts.values()]) : null
 }
 
 export function tokensToString(tokens: Array<EmiToken>): string {
@@ -486,49 +565,67 @@ export function isEmojiOnly(tokens: Array<EmiToken>): boolean {
   return words.length > 0 && words.every(t => t.feature.pos === '絵文字')
 }
 
+type Candidate = { item: string, score: number, emojiOnly: boolean }
+
 export function createTextFromInputs(textInputs: Array<string>) {
   const sentences = buildCorpus(textInputs)
-  const model = new NgramModel()
-  sentences.forEach(s => model.addSentence(s))
+  const forward = new NgramModel()
+  const backward = new NgramModel()
+  sentences.forEach(s => {
+    forward.addSentence(s)
+    backward.addSentence([...s].reverse())
+  })
   const copyDetector = new CopyDetector(sentences)
   const lengthLimit = lengthLimitOf(sentences)
   const minimum = MIN_TOKEN_LENGTH + Math.floor(Math.random() * 5)
 
+  const collect = (gen: () => Array<EmiToken> | null): Array<Candidate> => {
+    const candidates = new Map<string, Candidate>()
+    for (let attempt = 0; attempt < MAX_ATTEMPTS && candidates.size < CANDIDATE_COUNT; attempt++) {
+      const tokens = gen()
+      if (!tokens) continue
+      const result = tokensToString(tokens)
+      const wordCount = tokens.filter(t => !isBoundary(t)).length
+      const emojiOnly = isEmojiOnly(tokens)
+      // 絵文字だけの投稿は短くても成立するため、長さの条件を課さない
+      if (!emojiOnly && (result.length < 5 || wordCount < minimum)) continue
+      if (!isBalanced(result) || candidates.has(result)) continue
+      // 絵文字1つだけの投稿は、元の投稿と同じでも丸写しとはみなさない
+      const singleEmoji = emojiOnly && wordCount === 1
+      const copyRatio = singleEmoji ? 0 : copyDetector.copyRatio(tokens)
+      // 入力そのもの、または元の1文の一部をそのまま切り出しただけの文は候補にしない
+      if (!singleEmoji && (textInputs.includes(result) || copyRatio >= 1)) continue
+      candidates.set(result, { item: result, score: scoreCandidate(forward, tokens, copyRatio, lengthLimit), emojiOnly })
+    }
+    return [...candidates.values()]
+  }
+
+  const choose = (pool: Array<Candidate>, kind: string) => {
+    const ranked = pool.sort((a, b) => b.score - a.score)
+    const result = pickBySoftmax(ranked, SELECTION_TEMPERATURE)
+    const rank = ranked.findIndex(c => c.item === result)
+    console.debug(`${kind}${ranked.length}件中${rank + 1}位を採用 (score: ${ranked[rank].score.toFixed(2)})`)
+    return result
+  }
+
   // 絵文字だけの投稿は、TL中で絵文字だけの文が占める割合と同じ確率で選ぶ
   // (平均対数尤度は文頭の確率の影響が大きく、短い絵文字だけの文はスコアで普通の文に勝てないため別枠にする)
   const emojiOnlyRate = sentences.length > 0 ? sentences.filter(isEmojiOnly).length / sentences.length : 0
+  const forwardCandidates = collect(() => generate(forward))
+  const emojiCandidates = forwardCandidates.filter(c => c.emojiOnly)
+  if (emojiCandidates.length > 0 && Math.random() < emojiOnlyRate) return choose(emojiCandidates, '絵文字だけの候補')
 
-  const candidates = new Map<string, { item: string, score: number, emojiOnly: boolean }>()
-  for (let attempt = 0; attempt < MAX_ATTEMPTS && candidates.size < CANDIDATE_COUNT; attempt++) {
-    const tokens = generate(model)
-    if (!tokens) continue
-    const result = tokensToString(tokens)
-    const wordCount = tokens.filter(t => !isBoundary(t)).length
-    const emojiOnly = isEmojiOnly(tokens)
-    // 絵文字だけの投稿は短くても成立するため、長さの条件を課さない
-    if (!emojiOnly && (result.length < 5 || wordCount < minimum)) continue
-    if (!isBalanced(result) || candidates.has(result)) continue
-    // 絵文字1つだけの投稿は、元の投稿と同じでも丸写しとはみなさない
-    const singleEmoji = emojiOnly && wordCount === 1
-    const copyRatio = singleEmoji ? 0 : copyDetector.copyRatio(tokens)
-    // 入力そのもの、または元の1文の一部をそのまま切り出しただけの文は候補にしない
-    if (!singleEmoji && (textInputs.includes(result) || copyRatio >= 1)) continue
-    candidates.set(result, { item: result, score: scoreCandidate(model, tokens, copyRatio, lengthLimit), emojiOnly })
+  // TLの話題(名詞)を1つ選び、その前後に文を生成する
+  const topic = pickTopic(sentences)
+  if (topic) {
+    const topicCandidates = collect(() => generateAround(forward, backward, topic)).filter(c => !c.emojiOnly)
+    if (topicCandidates.length > 0) return choose(topicCandidates, `話題「${topic.surface}」の候補`)
+    console.debug(`話題「${topic.surface}」から文を生成できなかったため、話題なしで生成します`)
   }
 
-  if (candidates.size === 0) {
-    console.warn('Text generation retry limit exceeded.')
-    return ''
-  }
-  const all = [...candidates.values()]
-  const emojiCandidates = all.filter(c => c.emojiOnly)
-  const textCandidates = all.filter(c => !c.emojiOnly)
-  const useEmoji = emojiCandidates.length > 0 && (textCandidates.length === 0 || Math.random() < emojiOnlyRate)
-
-  const ranked = (useEmoji ? emojiCandidates : textCandidates).sort((a, b) => b.score - a.score)
-  const result = pickBySoftmax(ranked, SELECTION_TEMPERATURE)
-  const rank = ranked.findIndex(c => c.item === result)
-  const kind = useEmoji ? '絵文字だけの候補' : '候補'
-  console.debug(`${kind}${ranked.length}件中${rank + 1}位を採用 (score: ${ranked[rank].score.toFixed(2)})`)
-  return result
+  const textCandidates = forwardCandidates.filter(c => !c.emojiOnly)
+  if (textCandidates.length > 0) return choose(textCandidates, '候補')
+  if (emojiCandidates.length > 0) return choose(emojiCandidates, '絵文字だけの候補')
+  console.warn('Text generation retry limit exceeded.')
+  return ''
 }
