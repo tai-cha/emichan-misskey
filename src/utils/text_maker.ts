@@ -6,14 +6,12 @@ import Config from '@/utils/config.js'
 // load env
 Config
 
+// 次トークンを決めるときに参照する直前トークン数の最大値
 const MAX_MATCH_LENGTH = 4
-// 最大マッチ長 + 次の1トークン分を保持できる長さが必要
-const CHUNK_SIZE = MAX_MATCH_LENGTH + 1
-const MIN_CHUNK_LENGTH = 3
-const TERMINATION_PROBABILITY = 0.5
-const NOUN_TERMINATION_RATIO = 1.25
+const MIN_TOKEN_LENGTH = 3
+// 生成が終わらない場合の打ち切り長
+const MAX_TOKEN_LENGTH = 80
 const emojiRegex = /:[0-9A-z_\-]+:/
-const endLetters = ["\n", "。", "　"]
 
 const match_length = (): number => {
   const n = 5
@@ -58,7 +56,7 @@ export function sanitize(nodes: Array<mfm.MfmNode>): Array<mfm.MfmNode> {
   return nodes.map(n => sanitizeLoop(n)).flat()
 }
 
-type EmiToken = {
+export type EmiToken = {
   id: number | undefined,
   surface: string,
   feature: {
@@ -68,175 +66,156 @@ type EmiToken = {
   [key: string]: any
 }
 
-export function tokenize(mfm: Array<mfm.MfmNode>): Array<EmiToken> {
-  let tokens: Array<EmiToken> = mfm.map(node => {
+const BOS_TOKEN: EmiToken = { surface: 'BOS', feature: { pos: 'BOS/EOS' }, id: undefined }
+const EOS_TOKEN: EmiToken = { surface: 'EOS', feature: { pos: 'BOS/EOS' }, id: undefined }
+
+const isBoundary = (t: EmiToken) => t.feature.pos === 'BOS/EOS'
+const isBOS = (t: EmiToken) => isBoundary(t) && t.surface === 'BOS'
+const isEOS = (t: EmiToken) => isBoundary(t) && t.surface === 'EOS'
+
+function mecab(text: string): Array<EmiToken> {
+  let options = {}
+  if (Config.mecabDicDir) options = { ...options, dicdir: Config.mecabDicDir }
+  // MeCabが付与するBOS/EOSは除き、文の区切りはtokenize側で管理する
+  return (tokenizeSync(text, options).flat() as unknown as EmiToken[])
+    .filter(t => !isBoundary(t) && t.surface !== '')
+}
+
+// 改行ごとに BOS ... EOS で囲んだトークン列を返す
+// MFMノードの境界では文を区切らず、連続するテキストはまとめて解析する
+export function tokenize(nodes: Array<mfm.MfmNode>): Array<EmiToken> {
+  const lines: Array<Array<EmiToken>> = [[]]
+  let buffer = ''
+  const flush = () => {
+    if (buffer.trim() !== '') lines[lines.length - 1].push(...mecab(buffer))
+    buffer = ''
+  }
+
+  for (const node of nodes) {
     if (node.type == 'text') {
-      let options = {}
-      if (Config.mecabDicDir) options = { ...options, dicdir: Config.mecabDicDir }
-      return tokenizeSync(node.props.text, options).flat() as unknown as EmiToken[]
-    }
-    if (node.type == 'unicodeEmoji') {
-      return { surface: node.props.emoji, feature: { pos: '絵文字' } } as EmiToken
-    }
-    if (node.type == 'emojiCode') {
-      return { surface: `:${node.props.name}:`, feature: { pos: '絵文字' } } as EmiToken
-    }
-  }).flat().filter((t): t is EmiToken => t !== undefined)
-  if (tokens.length > 0 && tokens[0]?.surface === '') {
-    tokens = tokens.slice(1)
-  }
-
-  // MeCabの設定によってはBOS/EOSが付与されないため、強制的に付与する
-  if (tokens.length > 0) {
-    if (tokens[0].surface !== 'BOS') {
-      tokens.unshift({ surface: 'BOS', feature: { pos: 'BOS/EOS' }, id: undefined })
-    }
-    if (tokens[tokens.length - 1].surface !== 'EOS') {
-      tokens.push({ surface: 'EOS', feature: { pos: 'BOS/EOS' }, id: undefined })
+      node.props.text.split('\n').forEach((part, i) => {
+        if (i > 0) {
+          flush()
+          lines.push([])
+        }
+        buffer += part
+      })
+    } else if (node.type == 'unicodeEmoji') {
+      flush()
+      lines[lines.length - 1].push({ surface: node.props.emoji, feature: { pos: '絵文字' }, id: undefined })
+    } else if (node.type == 'emojiCode') {
+      flush()
+      lines[lines.length - 1].push({ surface: `:${node.props.name}:`, feature: { pos: '絵文字' }, id: undefined })
     }
   }
+  flush()
 
-  return tokens
+  return lines.filter(line => line.length > 0).flatMap(line => [BOS_TOKEN, ...line, EOS_TOKEN])
 }
 
-function createTokenChunk(tokens: Array<EmiToken>): Array<Array<EmiToken>> {
-  if (!tokens || tokens.length <= 0) return []
-  if (tokens.length < CHUNK_SIZE) return [[...tokens]]
-  let lines: Array<Array<EmiToken>> = [[]]
-  tokens.forEach((t) => {
-    const lastIdx = lines.length - 1
-    lines[lastIdx].push(t)
-    if (endLetters.includes(t.surface)) {
-      lines.push([])
-    }
-  })
-  let chunks: Array<Array<EmiToken>> = []
-  lines.forEach(line => {
-    line.forEach((token, i, arr) => {
-      if (i > arr.length - CHUNK_SIZE && token.surface === "\n") return
-      let res = arr.slice(i, i + CHUNK_SIZE)
-      chunks.push(res)
-    })
-  })
-
-  return chunks
+// BOS ... EOS 単位に分割する
+function splitSentences(tokens: Array<EmiToken>): Array<Array<EmiToken>> {
+  const sentences: Array<Array<EmiToken>> = []
+  let current: Array<EmiToken> = []
+  for (const t of tokens) {
+    if (isBOS(t)) current = []
+    current.push(t)
+    if (isEOS(t)) sentences.push(current)
+  }
+  return sentences
 }
 
-const EOS_TOKEN: EmiToken = { surface: "EOS", feature: { pos: "BOS/EOS" }, id: undefined }
+// 表層形が"BOS"/"EOS"の通常の単語と区別するため、境界トークンには印を付ける
+const tokenKey = (t: EmiToken) => isBoundary(t) ? `\u0001${t.surface}` : t.surface
+const contextKey = (tokens: Array<EmiToken>) => tokens.map(tokenKey).join('\u0000')
 
-// 戻り値: [マッチに使ったトークン数, チャンク]。チャンクの先頭からマッチ数分は既出なので出力されない
-function selectChunk(chunks: Array<Array<EmiToken>>, start: Array<EmiToken>): [number, Array<EmiToken>] {
-  // Tier 1: Surface Match (流暢さ最優先)
-  // 長い文脈から順に試し、見つからなければ短い文脈にバックオフする
-  for (let len = start.length; len >= 1; len--) {
-    const context = start.slice(-len)
-    const matched_surface = chunks.filter(chunk =>
-      chunk.length > len && context.every((el, i) => chunk[i].surface === el.surface)
-    )
-    if (matched_surface.length > 0) {
-      // 重複するチャンクも候補に含まれるため、出現頻度に比例した選択になる
-      const selected = matched_surface[Math.floor(Math.random() * matched_surface.length)]
-      // 次の1トークンだけを採用する
-      return [len, selected.slice(0, len + 1)]
-    }
+type Candidates = Map<string, { token: EmiToken, count: number }>
+
+function weightedPick(candidates: Array<{ token: EmiToken, count: number }>): EmiToken {
+  const total = candidates.reduce((sum, c) => sum + c.count, 0)
+  let r = Math.random() * total
+  for (const c of candidates) {
+    r -= c.count
+    if (r < 0) return c.token
   }
-
-  // Tier 2: 確率的終了判定 (長さの厳格な制御)
-  // 助詞や接続詞で終わるのは不自然なので避ける
-  const lastToken = start[start.length - 1]
-  const lastPos = lastToken?.feature.pos
-  const isBadEndPos = ['助詞', '接続詞'].includes(lastPos)
-  const isNounEnd = lastPos === '名詞'
-
-  // 名詞の場合は終了確率を上げる (相対値)、それ以外はデフォルト
-  const threshold = isNounEnd
-    ? Math.min(1, TERMINATION_PROBABILITY * NOUN_TERMINATION_RATIO)
-    : TERMINATION_PROBABILITY
-
-  if (start.length > 0 && !isBadEndPos && Math.random() < threshold) {
-    return [0, [EOS_TOKEN]]
-  }
-
-  // Tier 3: 品詞フォールバック (文法的な安全ネット)
-  if (start.length > 0) {
-    // チャンクの最初の単語の品詞が、BOS/EOSでないものを抽出
-    let matched_pos = chunks.filter(chunk => {
-      if (chunk.length <= 0) return false
-      const firstPos = chunk[0].feature.pos
-      if (firstPos === 'BOS/EOS') return false
-
-      // 不自然な繋がりを避ける
-      const lastToken = start[start.length - 1]
-      const lastPos = lastToken?.feature.pos
-      if (lastPos === '助詞' && firstPos === '助詞') return false
-
-      return true
-    }).filter(chunk => chunk.length !== start.length)
-
-    if (matched_pos.length > 0) {
-      let selectedIdx = Math.floor(Math.random() * matched_pos.length)
-      // 文脈とは繋がらないため、チャンク全体を新しく出力する
-      return [0, matched_pos[selectedIdx]]
-    }
-  }
-
-  // Tier 4: 最終フォールバック（破綻終了）
-  return [0, [EOS_TOKEN]]
+  return candidates[candidates.length - 1].token
 }
 
-function createResultChunk(chunks: Array<Array<EmiToken>>) {
-  const startCandidates = chunks.filter((chunk) => (chunk.length > 1 && chunk[0]?.surface === "BOS" && chunk[0]?.feature.pos === "BOS/EOS") && !['助詞'].includes(chunk[1].feature.pos))
+// 直前 1〜maxOrder トークンを文脈とし、次に来るトークンの出現回数を保持する
+export class NgramModel {
+  private readonly table = new Map<string, Candidates>()
 
-  const start = startCandidates[Math.floor(Math.random() * startCandidates.length)]
-  if (!start) return []
-  // 開始時は BOS + 最初の1トークンのみ採用する
-  let result: Array<[number, Array<EmiToken>]> = [[0, start.slice(0, 2)]]
-  // 文脈は直前のチャンクではなく、これまでに生成した(出力された)トークン列から取る
-  let generated: Array<EmiToken> = start.slice(0, 2)
+  constructor(readonly maxOrder: number = MAX_MATCH_LENGTH) { }
 
-  let cnt = 0
-  // cnt条件未満または生成した最後のトークンが終端でないとき
-  while (cnt < 50 && !['。', "EOS"].includes(generated[generated.length - 1]?.surface)) {
-    const this_match_length = match_length()
-    const [matched, selected] = selectChunk(chunks, generated.slice(-this_match_length))
-    result.push([matched, selected])
-    generated = generated.concat(selected.slice(matched))
-    cnt += 1
-  }
-  return result
-}
-
-function chunkToString(chunks: Array<[number, Array<EmiToken>]>): string {
-  if (chunks.length < 1) return ''
-
-  let _chunks = chunks.map((chunk) => {
-    return chunk[1].map((word, i, words) => {
-      if (i <= chunk[0] - 1) return ''
-
-      if (word.feature.pos === 'BOS/EOS') {
-        if (words?.[i - 1]?.surface === 'EOS' && word.surface === 'BOS') return "\n"
-        else return ''
+  // sentence は BOS で始まり EOS で終わるトークン列
+  addSentence(sentence: Array<EmiToken>) {
+    for (let i = 1; i < sentence.length; i++) {
+      const next = sentence[i]
+      for (let n = 1; n <= this.maxOrder && i - n >= 0; n++) {
+        const key = contextKey(sentence.slice(i - n, i))
+        let candidates = this.table.get(key)
+        if (!candidates) {
+          candidates = new Map()
+          this.table.set(key, candidates)
+        }
+        const entry = candidates.get(tokenKey(next))
+        if (entry) entry.count += 1
+        else candidates.set(tokenKey(next), { token: next, count: 1 })
       }
-      if (words?.[i - 1]?.surface.match(emojiRegex) && word.surface.match(/^[0-9A-z]+.*/)) {
-        return `𝅳${word.surface}`
-      }
-      if (words?.[i - 1]?.surface.match(/^[0-9A-z.!]{2,}/) && word.surface.match(/^[0-9A-z.!]+/)) {
-        // English
-        return ` ${word.surface}`
-      }
-      return word.surface
-    })
-  })
+    }
+  }
 
-  if (_chunks.length === 1) return _chunks[0].join('')
-
-  return _chunks.map(t => t.join('')).join('')
+  // 長い文脈から順に候補を探し、なければ短い文脈にバックオフする
+  // accept で候補を絞り込み、残らなければさらに短い文脈を試す
+  next(context: Array<EmiToken>, accept: (t: EmiToken) => boolean = () => true): EmiToken | null {
+    for (let n = Math.min(this.maxOrder, context.length); n >= 1; n--) {
+      const candidates = this.table.get(contextKey(context.slice(-n)))
+      if (!candidates) continue
+      const accepted = [...candidates.values()].filter(c => accept(c.token))
+      if (accepted.length > 0) return weightedPick(accepted)
+    }
+    return null
+  }
 }
 
-function createChunksFromInput(text: string) {
-  const mfmTree = mfm.parse(text);
-  let sanitized = sanitize(mfmTree);
-  return createTokenChunk(tokenize(sanitized))
+export function buildModel(textInputs: Array<string>): NgramModel {
+  const model = new NgramModel()
+  textInputs
+    .filter(i => !i.match(/^[0-9A-z\n ]+$/))
+    .forEach(txt => splitSentences(tokenize(sanitize(mfm.parse(txt)))).forEach(s => model.addSentence(s)))
+  return model
+}
+
+// BOS から EOS まで生成する。終端に到達できなかった場合は null
+export function generate(model: NgramModel): Array<EmiToken> | null {
+  const tokens: Array<EmiToken> = [BOS_TOKEN]
+  // 助詞から始まるのは不自然なので避ける
+  const first = model.next(tokens, t => t.feature.pos !== '助詞' && !isEOS(t))
+  if (!first) return null
+  tokens.push(first)
+
+  while (tokens.length < MAX_TOKEN_LENGTH) {
+    const next = model.next(tokens.slice(-match_length()))
+    if (!next) return null
+    tokens.push(next)
+    if (isEOS(next)) return tokens
+  }
+  return null
+}
+
+export function tokensToString(tokens: Array<EmiToken>): string {
+  const words = tokens.filter(t => !isBoundary(t))
+  return words.map((word, i) => {
+    const prev = words[i - 1]
+    if (prev?.surface.match(emojiRegex) && word.surface.match(/^[0-9A-z]+.*/)) {
+      return `𝅳${word.surface}`
+    }
+    if (prev?.surface.match(/^[0-9A-z.!]{2,}/) && word.surface.match(/^[0-9A-z.!]+/)) {
+      // English
+      return ` ${word.surface}`
+    }
+    return word.surface
+  }).join('')
 }
 
 function assertPairBrackets(text: string): boolean {
@@ -245,29 +224,21 @@ function assertPairBrackets(text: string): boolean {
 }
 
 export function createTextFromInputs(textInputs: Array<string>) {
-  const chunks = textInputs.filter(i => !i.match(/^[0-9A-z\n ]+$/)).map(txt => createChunksFromInput(txt))
-  let result: string = ''
-  let needs_retry = true
-  const minimum = MIN_CHUNK_LENGTH + Math.floor(Math.random() * 5)
-  const retry_condition = () => {
-    return result === '' ||
-      !assertPairBrackets(result) ||
-      needs_retry ||
-      result.length < 5 ||
-      createChunksFromInput(result).length < minimum
-  }
+  const model = buildModel(textInputs)
+  const minimum = MIN_TOKEN_LENGTH + Math.floor(Math.random() * 5)
 
-  let retry_count = 0
-  while (retry_condition()) {
-    if (retry_count > 100) {
-      console.warn('Text generation retry limit exceeded.')
-      return ''
+  for (let retry_count = 0; retry_count <= 100; retry_count++) {
+    const tokens = generate(model)
+    if (!tokens) continue
+    const result = tokensToString(tokens)
+    const wordCount = tokens.filter(t => !isBoundary(t)).length
+    if (result.length < 5 || wordCount < minimum || !assertPairBrackets(result)) continue
+    if (textInputs.includes(result)) {
+      console.debug('同じ文章が生成されたため再試行します。')
+      continue
     }
-    retry_count += 1
-    result = chunkToString(createResultChunk(chunks.flat(1)))
-    let same = textInputs.find(i => i === result)
-    if (same == undefined) needs_retry = false
-    else console.debug('同じ文章が生成されたため再試行します。')
+    return result
   }
-  return result
+  console.warn('Text generation retry limit exceeded.')
+  return ''
 }

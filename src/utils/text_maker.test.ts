@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, type EmiToken } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -46,7 +46,80 @@ describe('text_maker', () => {
     });
   });
 
+  describe('tokenize (sentence boundaries)', () => {
+    const surfaces = (text: string) => tokenize(sanitize(mfm.parse(text))).map(t => t.surface)
+
+    it('should not split sentences at MFM node boundaries', () => {
+      expect(surfaces('**太字**です')).toEqual(['BOS', '太字', 'です', 'EOS'])
+    });
+
+    it('should keep emojis inside the sentence', () => {
+      expect(surfaces('おはよう:wave:みんな')).toEqual(['BOS', 'おはよう', ':wave:', 'みんな', 'EOS'])
+    });
+
+    it('should split sentences only at line breaks and skip empty lines', () => {
+      expect(surfaces('猫\n\n犬')).toEqual(['BOS', '猫', 'EOS', 'BOS', '犬', 'EOS'])
+    });
+  });
+
+  describe('NgramModel', () => {
+    const tok = (surface: string, pos = '名詞'): EmiToken => ({ surface, feature: { pos }, id: undefined })
+    const BOS = tok('BOS', 'BOS/EOS')
+    const EOS = tok('EOS', 'BOS/EOS')
+
+    it('should learn EOS as a next token', () => {
+      const model = new NgramModel()
+      model.addSentence([BOS, tok('猫'), tok('好き'), EOS])
+      expect(model.next([tok('猫'), tok('好き')])?.surface).toBe('EOS')
+    });
+
+    it('should back off to a shorter context when the long context is unseen', () => {
+      const model = new NgramModel()
+      model.addSentence([BOS, tok('犬'), tok('が'), tok('走る'), EOS])
+      // [猫, が] は未学習だが [が] からは "走る" が続く
+      expect(model.next([tok('猫'), tok('が')])?.surface).toBe('走る')
+    });
+
+    it('should back off when candidates are rejected', () => {
+      const model = new NgramModel()
+      model.addSentence([BOS, tok('猫'), tok('が'), tok('寝る'), EOS])
+      model.addSentence([BOS, tok('犬'), tok('が'), tok('走る'), EOS])
+      // [猫, が] の候補 "寝る" を拒否すると [が] の候補から選ばれる
+      expect(model.next([tok('猫'), tok('が')], t => t.surface !== '寝る')?.surface).toBe('走る')
+      expect(model.next([tok('猫'), tok('が')], () => false)).toBeNull()
+    });
+
+    it('should not confuse a word "BOS" with the sentence boundary', () => {
+      const model = new NgramModel()
+      model.addSentence([BOS, tok('BOS'), tok('です'), EOS])
+      expect(model.next([BOS])?.surface).toBe('BOS')
+      expect(model.next([tok('BOS')])?.surface).toBe('です')
+    });
+
+    it('should generate a sentence from BOS to EOS using only learned transitions', () => {
+      vi.restoreAllMocks();
+      const inputs = ['今日はいい天気ですね。', '明日は雨が降るらしい', '雨の日は読書がしたい']
+      const model = buildModel(inputs)
+      const bigrams = new Set(inputs.flatMap(text => {
+        const t = tokenize(sanitize(mfm.parse(text))).map(x => x.surface)
+        return t.slice(1).map((s, i) => `${t[i]} ${s}`)
+      }))
+      for (let i = 0; i < 20; i++) {
+        const tokens = generate(model)!
+        expect(tokens[0].surface).toBe('BOS')
+        expect(tokens[tokens.length - 1].surface).toBe('EOS')
+        tokens.slice(1).forEach((t, j) => expect(bigrams).toContain(`${tokens[j].surface} ${t.surface}`))
+        expect(tokensToString(tokens)).not.toMatch(/BOS|EOS/)
+      }
+    });
+  });
+
   describe('createTextFromInputs', () => {
+    beforeEach(() => {
+      // 乱数を固定すると毎回同じ候補が選ばれ入力の丸写ししか生成できないため、実際の乱数を使う
+      vi.restoreAllMocks();
+    });
+
     it('should create text from inputs', () => {
       const inputs = [
         '今日はとてもいい天気ですね。散歩に行きたくなります。',
