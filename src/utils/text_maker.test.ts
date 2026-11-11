@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, updateBrackets, type EmiToken, type SanitizedNode } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, updateBrackets, buildCorpus, CopyDetector, countRepeatedNgrams, pickBySoftmax, lengthLimitOf, scoreCandidate, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -203,6 +203,89 @@ describe('text_maker', () => {
     });
   });
 
+  describe('scoring', () => {
+    const tok = (surface: string, pos = '名詞'): EmiToken => ({ surface, feature: { pos }, id: undefined })
+    const sentence = (...surfaces: string[]) => [tok('BOS', 'BOS/EOS'), ...surfaces.map(s => tok(s)), tok('EOS', 'BOS/EOS')]
+
+    it('averageLogProb should prefer learned sequences over backed-off ones', () => {
+      const model = new NgramModel()
+      model.addSentence(sentence('猫', 'が', '寝る'))
+      model.addSentence(sentence('犬', 'が', '走る'))
+      model.addSentence(sentence('犬', 'と', '遊ぶ'))
+      const learned = model.averageLogProb(sentence('猫', 'が', '寝る'))
+      const mixed = model.averageLogProb(sentence('猫', 'が', '走る'))
+      const unseen = model.averageLogProb(sentence('猫', 'と', '寝る'))
+      expect(learned).toBeGreaterThan(mixed)
+      expect(mixed).toBeGreaterThan(unseen)
+    });
+
+    it('CopyDetector should find the longest span copied from a single source sentence', () => {
+      const detector = new CopyDetector([sentence('a', 'b', 'c', 'd'), sentence('x', 'y')])
+      expect(detector.longestCopiedSpan(sentence('a', 'b', 'c', 'x', 'y'))).toBe(3)
+      // 別々の文にまたがる "d x" は連続したコピーではない
+      expect(detector.longestCopiedSpan(sentence('d', 'x'))).toBe(1)
+      expect(detector.copyRatio(sentence('b', 'c', 'd'))).toBe(1)
+      expect(detector.copyRatio(sentence('a', 'b', 'y', 'x'))).toBe(0.5)
+    });
+
+    it('CopyDetector should treat copied sentences joined at terminators as a copy', () => {
+      const detector = new CopyDetector([sentence('a', 'b', '。', 'c', 'd'), sentence('x', 'y', '。')])
+      // "a b 。" と "x y 。" はそれぞれ別の文の丸写し
+      expect(detector.copyRatio(sentence('a', 'b', '。', 'x', 'y', '。'))).toBe(1)
+      // 後半だけが新しい組み合わせ
+      expect(detector.copyRatio(sentence('a', 'b', '。', 'x', 'd'))).toBe(4 / 5)
+      // 全角スペースも文の区切りとみなす
+      const spaced = new CopyDetector([sentence('a', 'b', '　', 'c'), sentence('x', 'y')])
+      expect(spaced.copyRatio(sentence('a', 'b', '　', 'x', 'y'))).toBe(1)
+    });
+
+    it('CopyDetector should not treat spans across gaps as copies', () => {
+      const detector = new CopyDetector(buildCorpus(['今日は #猫の日 だよ']))
+      const tokens = tokenize(sanitize(mfm.parse('今日はだよ')))
+      expect(detector.copyRatio(tokens)).toBeLessThan(1)
+    });
+
+    it('countRepeatedNgrams should count repeated 3-token sequences', () => {
+      expect(countRepeatedNgrams(sentence('a', 'b', 'c', 'd'))).toBe(0)
+      expect(countRepeatedNgrams(sentence('a', 'b', 'c', 'a', 'b', 'c'))).toBe(1)
+      expect(countRepeatedNgrams(sentence('a', 'b', 'c', 'a', 'b', 'c', 'a', 'b', 'c'))).toBe(4)
+    });
+
+    it('lengthLimitOf should return the percentile of source sentence lengths', () => {
+      const sentences = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => sentence(...Array(n).fill('a')))
+      expect(lengthLimitOf(sentences, 0.9)).toBe(9)
+      expect(lengthLimitOf([])).toBe(Infinity)
+    });
+
+    it('scoreCandidate should penalize only candidates longer than the limit', () => {
+      const model = new NgramModel()
+      const words = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`)
+      model.addSentence(sentence(...words(20)))
+      const short = sentence(...words(5))
+      const long = sentence(...words(20))
+      // 上限以下なら長さによる減点はない
+      expect(scoreCandidate(model, short, 0, 10)).toBe(scoreCandidate(model, short, 0))
+      // 上限を超えると減点される
+      expect(scoreCandidate(model, long, 0, 10)).toBeLessThan(scoreCandidate(model, long, 0))
+    });
+
+    it('pickBySoftmax should mostly pick high scores but sometimes lower ones', () => {
+      vi.restoreAllMocks();
+      const items = [{ item: 'top', score: 0 }, { item: 'mid', score: -0.3 }, { item: 'low', score: -1 }]
+      const counts = (temperature: number) => {
+        const c: Record<string, number> = { top: 0, mid: 0, low: 0 }
+        for (let i = 0; i < 3000; i++) c[pickBySoftmax(items, temperature)] += 1
+        return c
+      }
+      const cold = counts(0.01)
+      expect(cold.top).toBe(3000)
+      const warm = counts(0.3)
+      expect(warm.top).toBeGreaterThan(warm.mid)
+      expect(warm.mid).toBeGreaterThan(warm.low)
+      expect(warm.low).toBeGreaterThan(0)
+    });
+  });
+
   describe('createTextFromInputs', () => {
     beforeEach(() => {
       // 乱数を固定すると毎回同じ候補が選ばれ入力の丸写ししか生成できないため、実際の乱数を使う
@@ -232,6 +315,8 @@ describe('text_maker', () => {
         const result = createTextFromInputs(inputs);
         expect(result).toBeTypeOf('string');
         expect(result.length).toBeGreaterThan(0);
+        // 入力の一部をそのまま切り出しただけの文は採用されない
+        expect(inputs.some(input => input.includes(result)), result).toBe(false);
       }
     });
 

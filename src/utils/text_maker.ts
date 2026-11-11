@@ -12,6 +12,23 @@ const MIN_TOKEN_LENGTH = 3
 const MAX_TOKEN_LENGTH = 80
 const emojiRegex = /:[0-9A-z_\-]+:/
 
+// 候補を集める数と、そのための最大試行回数
+const CANDIDATE_COUNT = 30
+const MAX_ATTEMPTS = 300
+// 長い文脈で見つからず短い文脈に落ちるたびに確率へ掛ける係数 (Stupid Backoff)
+const BACKOFF_PENALTY = 0.4
+// 元の1文からそのまま使った部分の割合がこれを超えるとペナルティ
+const COPY_TOLERANCE = 0.7
+const COPY_PENALTY = 4
+// 同じ3トークン列が繰り返されるごとのペナルティ (「〜ですが、〜ですが、」のようなループ対策)
+const REPEAT_NGRAM = 3
+const REPEAT_PENALTY = 0.5
+// 元の文の長さ(トークン数)のこの分位点を超える長さの候補を減点する
+const LENGTH_LIMIT_PERCENTILE = 0.9
+const LENGTH_PENALTY = 2.0
+// 候補選択の温度。高いほどスコアの低い候補も選ばれやすくなる
+const SELECTION_TEMPERATURE = 0.3
+
 const match_length = (): number => {
   const n = 5
   const m = 8.0
@@ -174,6 +191,7 @@ function weightedPick(candidates: Array<{ token: EmiToken, count: number }>): Em
 // 直前 1〜maxOrder トークンを文脈とし、次に来るトークンの出現回数を保持する
 export class NgramModel {
   private readonly table = new Map<string, Candidates>()
+  private readonly totals = new Map<string, number>()
 
   constructor(readonly maxOrder: number = MAX_MATCH_LENGTH) { }
 
@@ -194,8 +212,32 @@ export class NgramModel {
         const entry = candidates.get(tokenKey(next))
         if (entry) entry.count += 1
         else candidates.set(tokenKey(next), { token: next, count: 1 })
+        this.totals.set(key, (this.totals.get(key) ?? 0) + 1)
       }
     }
+  }
+
+  // 1トークンあたりの平均対数尤度 (Stupid Backoff)。流暢さの指標として使う
+  averageLogProb(sentence: Array<EmiToken>): number {
+    let sum = 0
+    let count = 0
+    for (let i = 1; i < sentence.length; i++) {
+      const next = tokenKey(sentence[i])
+      let p = 0
+      let penalty = 1
+      for (let n = Math.min(this.maxOrder, i); n >= 1; n--) {
+        const key = contextKey(sentence.slice(i - n, i))
+        const entry = this.table.get(key)?.get(next)
+        if (entry) {
+          p = penalty * entry.count / this.totals.get(key)!
+          break
+        }
+        penalty *= BACKOFF_PENALTY
+      }
+      sum += Math.log(p > 0 ? p : 1e-6)
+      count += 1
+    }
+    return count > 0 ? sum / count : -Infinity
   }
 
   // 長い文脈から順に候補を探し、なければ短い文脈にバックオフする
@@ -211,12 +253,73 @@ export class NgramModel {
   }
 }
 
+export function buildCorpus(textInputs: Array<string>): Array<Array<EmiToken>> {
+  return textInputs
+    .filter(i => !i.match(/^[0-9A-z\n ]+$/))
+    .flatMap(txt => splitSentences(tokenize(sanitize(mfm.parse(txt)))))
+}
+
 export function buildModel(textInputs: Array<string>): NgramModel {
   const model = new NgramModel()
-  textInputs
-    .filter(i => !i.match(/^[0-9A-z\n ]+$/))
-    .forEach(txt => splitSentences(tokenize(sanitize(mfm.parse(txt)))).forEach(s => model.addSentence(s)))
+  buildCorpus(textInputs).forEach(s => model.addSentence(s))
   return model
+}
+
+// 文の区切りとみなす記号 (SNSでは全角スペースも文の区切りとして使われる)
+const SENTENCE_TERMINATORS = /^[。．！？!?　]+$/
+
+// 生成文のうち、元の1文から連続してそのまま使われている部分を調べる
+export class CopyDetector {
+  private readonly spans = new Set<string>()
+
+  constructor(sentences: Array<Array<EmiToken>>, readonly maxSpan: number = 40) {
+    for (const sentence of sentences) {
+      // GAPで区切られた断片ごとに、連続するトークン列をすべて登録する
+      const fragments: Array<Array<EmiToken>> = [[]]
+      for (const t of sentence.filter(t => !isBoundary(t))) {
+        if (isGap(t)) fragments.push([])
+        else fragments[fragments.length - 1].push(t)
+      }
+      for (const fragment of fragments) {
+        for (let i = 0; i < fragment.length; i++) {
+          for (let j = i + 1; j <= Math.min(fragment.length, i + maxSpan); j++) {
+            this.spans.add(contextKey(fragment.slice(i, j)))
+          }
+        }
+      }
+    }
+  }
+
+  // 元の1文から連続して使われている最長のトークン数
+  longestCopiedSpan(tokens: Array<EmiToken>): number {
+    const words = tokens.filter(t => !isBoundary(t))
+    let longest = 0
+    for (let i = 0; i < words.length; i++) {
+      // 長さ L の部分列が元文にあれば、それより短い部分列も必ずある
+      for (let j = i + longest + 1; j <= words.length; j++) {
+        if (!this.spans.has(contextKey(words.slice(i, j)))) break
+        longest = j - i
+      }
+    }
+    return longest
+  }
+
+  // 生成文のうち元の1文からそのまま使った部分の割合 (1 なら丸写し)
+  // 「。」などで区切った文ごとに求めてトークン数で加重平均する
+  // (丸写しの文を「。」で繋いだだけの文章も丸写しとみなすため)
+  copyRatio(tokens: Array<EmiToken>): number {
+    const words = tokens.filter(t => !isBoundary(t))
+    if (words.length === 0) return 1
+    const segments: Array<Array<EmiToken>> = [[]]
+    for (const t of words) {
+      segments[segments.length - 1].push(t)
+      if (SENTENCE_TERMINATORS.test(t.surface)) segments.push([])
+    }
+    const copied = segments
+      .filter(segment => segment.length > 0)
+      .reduce((sum, segment) => sum + this.longestCopiedSpan(segment), 0)
+    return copied / words.length
+  }
 }
 
 const BRACKET_PAIRS = new Map([
@@ -279,22 +382,78 @@ export function tokensToString(tokens: Array<EmiToken>): string {
   }).join('')
 }
 
+// スコアが高いほど選ばれやすいが、低い候補も確率的に選ばれる (温度付きsoftmax)
+export function pickBySoftmax<T>(items: Array<{ item: T, score: number }>, temperature: number): T {
+  const max = Math.max(...items.map(i => i.score))
+  const weights = items.map(i => Math.exp((i.score - max) / temperature))
+  let r = Math.random() * weights.reduce((a, b) => a + b, 0)
+  for (let i = 0; i < items.length; i++) {
+    r -= weights[i]
+    if (r < 0) return items[i].item
+  }
+  return items[items.length - 1].item
+}
+
+// 同じ n トークン列が2回目以降に現れた回数
+export function countRepeatedNgrams(tokens: Array<EmiToken>, n: number = REPEAT_NGRAM): number {
+  const words = tokens.filter(t => !isBoundary(t))
+  const seen = new Set<string>()
+  let repeated = 0
+  for (let i = 0; i + n <= words.length; i++) {
+    const key = contextKey(words.slice(i, i + n))
+    if (seen.has(key)) repeated += 1
+    else seen.add(key)
+  }
+  return repeated
+}
+
+const wordCountOf = (tokens: Array<EmiToken>) => tokens.filter(t => !isBoundary(t) && !isGap(t)).length
+
+// 元の文の長さの分布から、長すぎるとみなす長さを求める
+export function lengthLimitOf(sentences: Array<Array<EmiToken>>, percentile: number = LENGTH_LIMIT_PERCENTILE): number {
+  const lengths = sentences.map(wordCountOf).sort((a, b) => a - b)
+  if (lengths.length === 0) return Infinity
+  return Math.max(1, lengths[Math.floor(percentile * (lengths.length - 1))])
+}
+
+// lengthLimit を超えた長さの分だけ対数的に減点する (短い文・普通の長さの文は減点しない)
+export function scoreCandidate(model: NgramModel, tokens: Array<EmiToken>, copyRatio: number, lengthLimit: number = Infinity): number {
+  const fluency = model.averageLogProb(tokens)
+  return fluency
+    - COPY_PENALTY * Math.max(0, copyRatio - COPY_TOLERANCE)
+    - REPEAT_PENALTY * countRepeatedNgrams(tokens)
+    - LENGTH_PENALTY * Math.max(0, Math.log(wordCountOf(tokens) / lengthLimit))
+}
+
 export function createTextFromInputs(textInputs: Array<string>) {
-  const model = buildModel(textInputs)
+  const sentences = buildCorpus(textInputs)
+  const model = new NgramModel()
+  sentences.forEach(s => model.addSentence(s))
+  const copyDetector = new CopyDetector(sentences)
+  const lengthLimit = lengthLimitOf(sentences)
   const minimum = MIN_TOKEN_LENGTH + Math.floor(Math.random() * 5)
 
-  for (let retry_count = 0; retry_count <= 100; retry_count++) {
+  const candidates = new Map<string, { item: string, score: number }>()
+  for (let attempt = 0; attempt < MAX_ATTEMPTS && candidates.size < CANDIDATE_COUNT; attempt++) {
     const tokens = generate(model)
     if (!tokens) continue
     const result = tokensToString(tokens)
     const wordCount = tokens.filter(t => !isBoundary(t)).length
     if (result.length < 5 || wordCount < minimum || !isBalanced(result)) continue
-    if (textInputs.includes(result)) {
-      console.debug('同じ文章が生成されたため再試行します。')
-      continue
-    }
-    return result
+    if (candidates.has(result)) continue
+    const copyRatio = copyDetector.copyRatio(tokens)
+    // 入力そのもの、または元の1文の一部をそのまま切り出しただけの文は候補にしない
+    if (textInputs.includes(result) || copyRatio >= 1) continue
+    candidates.set(result, { item: result, score: scoreCandidate(model, tokens, copyRatio, lengthLimit) })
   }
-  console.warn('Text generation retry limit exceeded.')
-  return ''
+
+  if (candidates.size === 0) {
+    console.warn('Text generation retry limit exceeded.')
+    return ''
+  }
+  const ranked = [...candidates.values()].sort((a, b) => b.score - a.score)
+  const result = pickBySoftmax(ranked, SELECTION_TEMPERATURE)
+  const rank = ranked.findIndex(c => c.item === result)
+  console.debug(`候補${ranked.length}件中${rank + 1}位を採用 (score: ${ranked[rank].score.toFixed(2)})`)
+  return result
 }
