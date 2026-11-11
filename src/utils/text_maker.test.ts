@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, type EmiToken } from './text_maker.js';
+import { createTextFromInputs, sanitize, tokenize, NgramModel, buildModel, generate, tokensToString, type EmiToken, type SanitizedNode } from './text_maker.js';
 import * as mfm from 'mfm-js';
 
 describe('text_maker', () => {
@@ -20,15 +20,14 @@ describe('text_maker', () => {
         { type: 'unicodeEmoji', props: { emoji: '😀' } }
       ];
       const sanitized = sanitize(nodes);
-      expect(sanitized).toHaveLength(2);
-      expect(sanitized[0].type).toBe('text');
-      expect(sanitized[1].type).toBe('unicodeEmoji');
+      // 除去した要素の位置は gap になる
+      expect(sanitized.map(n => n.type)).toEqual(['text', 'gap', 'gap', 'unicodeEmoji']);
     });
   });
 
   describe('tokenize', () => {
     it('should return tokens', () => {
-      const nodes: mfm.MfmNode[] = [{ type: 'text', props: { text: '今日はいい天気' } }];
+      const nodes: SanitizedNode[] = [{ type: 'text', props: { text: '今日はいい天気' } }];
       const tokens = tokenize(nodes);
       expect(tokens.length).toBeGreaterThan(0);
       expect(tokens[0].surface).toBeDefined();
@@ -39,7 +38,7 @@ describe('text_maker', () => {
 
     it('should tokenize with a valid dictionary', () => {
       // 辞書が読み込めないと "[ifs]" のような異常トークンになるため、形態素解析結果を確認する
-      const nodes: mfm.MfmNode[] = [{ type: 'text', props: { text: '猫と遊んだ' } }];
+      const nodes: SanitizedNode[] = [{ type: 'text', props: { text: '猫と遊んだ' } }];
       const tokens = tokenize(nodes).filter(t => t.feature.pos !== 'BOS/EOS');
       expect(tokens.map(t => t.surface)).toEqual(['猫', 'と', '遊ん', 'だ']);
       expect(tokens.map(t => t.feature.pos)).toEqual(['名詞', '助詞', '動詞', '助動詞']);
@@ -59,6 +58,69 @@ describe('text_maker', () => {
 
     it('should split sentences only at line breaks and skip empty lines', () => {
       expect(surfaces('猫\n\n犬')).toEqual(['BOS', '猫', 'EOS', 'BOS', '犬', 'EOS'])
+    });
+  });
+
+  describe('MFM', () => {
+    // 文ごとに表層形を連結した文字列を返す。GAP は "|" で表す
+    const sentences = (text: string) => {
+      const result: string[] = []
+      for (const t of tokenize(sanitize(mfm.parse(text)))) {
+        if (t.surface === 'BOS' && t.feature.pos === 'BOS/EOS') result.push('')
+        else if (t.feature.pos === 'GAP') result[result.length - 1] += '|'
+        else if (t.feature.pos !== 'BOS/EOS') result[result.length - 1] += t.surface
+      }
+      return result
+    }
+
+    it.each([
+      ['**太字**と<small>小さい</small>と<i>斜体</i>と~~打ち消し~~', ['太字と小さいと斜体と打ち消し']],
+      ['$[shake 揺れる]文字', ['揺れる文字']],
+      ['$[x2 $[spin 回る]]よ', ['回るよ']],
+      ['[リンクの文字](https://example.com)を押して', ['リンクの文字を押して']],
+      ['?[サイレントリンク](https://example.com)です', ['サイレントリンクです']],
+      ['おはよう:wave:みんな😀', ['おはよう:wave:みんな😀']],
+    ])('should keep the visible text of decorations: %s', (input, expected) => {
+      expect(sentences(input)).toEqual(expected)
+    });
+
+    it.each([
+      ['$[ruby 漢字 かんじ]を読む', ['漢字を読む']],
+      ['$[ruby $[x2 漢字] かんじ]を読む', ['を読む']],
+    ])('should keep only the base text of ruby: %s', (input, expected) => {
+      expect(sentences(input)).toEqual(expected)
+    });
+
+    it.each([
+      ['今日は #猫の日 だよ', ['今日は|だよ']],
+      ['これ見て https://example.com すごい', ['これ見て|すごい']],
+      ['数式\\(x^2\\)です', ['数式|です']],
+      ['`inline code`を書いた', ['を書いた']],
+      ['@user おはよう', ['おはよう']],
+      ['@user@misskey.io さん @other こんにちは', ['さん|こんにちは']],
+      ['<plain>**そのまま**</plain>です', ['です']],
+    ])('should put a gap where inline elements are removed: %s', (input, expected) => {
+      expect(sentences(input)).toEqual(expected)
+    });
+
+    it.each([
+      ['前の行\n> 引用された文\n後の行', ['前の行', '引用された文', '後の行']],
+      ['> 一行目\n> 二行目', ['一行目', '二行目']],
+      ['前の行\n<center>中央</center>\n後の行', ['前の行', '中央', '後の行']],
+      ['前の行\n```\nconst a = 1\n```\n後の行', ['前の行', '後の行']],
+      ['前の行\n\\[x = 1\\]\n後の行', ['前の行', '後の行']],
+      ['misskey 検索\n後の行', ['後の行']],
+    ])('should separate block elements into their own lines: %s', (input, expected) => {
+      expect(sentences(input)).toEqual(expected)
+    });
+
+    it('should not learn transitions across gaps', () => {
+      const model = buildModel(['今日は #猫の日 だよ'])
+      const tok = (surface: string, pos = '名詞'): EmiToken => ({ surface, feature: { pos }, id: undefined })
+      // "は" の次は GAP なので学習されず、"だ" も文頭としては学習されない
+      expect(model.next([tok('は', '助詞')])).toBeNull()
+      expect(model.next([tok('BOS', 'BOS/EOS')], t => t.surface === 'だ')).toBeNull()
+      expect(model.next([tok('だ', '助動詞')])?.surface).toBe('よ')
     });
   });
 

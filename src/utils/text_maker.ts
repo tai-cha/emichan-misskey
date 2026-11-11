@@ -1,5 +1,4 @@
 import * as mfm from 'mfm-js'
-import { isMfmBlock } from 'mfm-js/built/node.js';
 import { tokenizeSync } from "@enjoyjs/node-mecab"
 import Config from '@/utils/config.js'
 
@@ -22,38 +21,55 @@ const match_length = (): number => {
   return Math.floor((MAX_MATCH_LENGTH - min) * Math.round(n * 2 * (Math.atan(m * Math.random())) / Math.PI) / n) + min
 }
 
-function sanitizeLoop<T extends mfm.MfmNode['type'], N extends mfm.NodeType<T>>(node: N): Array<N> {
-  const inlineTypes: mfm.MfmNode['type'][] = ['unicodeEmoji', 'emojiCode', 'bold', 'small', 'italic', 'strike', 'inlineCode', 'mathInline', 'mention', 'hashtag', 'url', 'link', 'fn', 'plain', 'text']
-  function isMfmInline(n: mfm.MfmNode): n is mfm.MfmInline {
-    return inlineTypes.includes(n.type)
-  }
-  function isMfmNode(n: mfm.MfmNode): n is N {
-    return isMfmBlock(n) || isMfmInline(n)
-  }
-  function isMfmNodeArray(nodes: Array<mfm.MfmNode>): nodes is Array<N> {
-    return nodes.every(isMfmNode)
-  }
-  if (['text', 'emojiCode', 'unicodeEmoji'].includes(node.type)) {
-    return [node]
-  }
+// 除去した要素の位置を示す。ここをまたぐトークンの繋がりは学習しない
+export type GapNode = { type: 'gap' }
+export type SanitizedNode = mfm.MfmText | mfm.MfmUnicodeEmoji | mfm.MfmEmojiCode | GapNode
 
-  // FIXME: ruby関数対応
-  if (node.type == 'fn' && node.props.name == 'ruby') {
-    return []
-  }
+const GAP: GapNode = { type: 'gap' }
+const LINE_BREAK: mfm.MfmText = { type: 'text', props: { text: '\n' } }
 
-  if (['url', 'mention', 'hashtag', 'link'].includes(node.type)) {
-    return []
-  } else if (node.children && node.children.length > 0 && isMfmNodeArray(node.children)) {
-    let children: Array<N> = node.children
-    return children.map(sanitizeLoop).flat()
-  } else {
-    return []
+// $[ruby 漢字 かんじ] の親文字(漢字)を取り出す
+function rubyBase(node: mfm.MfmFn): Array<SanitizedNode> {
+  const [child] = node.children
+  if (node.children.length !== 1 || child.type !== 'text') return [GAP]
+  const base = child.props.text.split(' ')[0]
+  return base ? [{ type: 'text', props: { text: base } }] : [GAP]
+}
+
+function sanitizeNode(node: mfm.MfmNode): Array<SanitizedNode> {
+  switch (node.type) {
+    case 'text':
+    case 'unicodeEmoji':
+    case 'emojiCode':
+      return [node]
+    // 文中から取り除くもの
+    case 'url':
+    case 'mention':
+    case 'hashtag':
+    case 'inlineCode':
+    case 'mathInline':
+    // MFM記法がそのまま含まれうるため除去する
+    case 'plain':
+      return [GAP]
+    // 取り除くブロック。パーサーが前後の改行を吸収するため、改行として扱う
+    case 'blockCode':
+    case 'mathBlock':
+    case 'search':
+      return [LINE_BREAK]
+    case 'quote':
+    case 'center':
+      return [LINE_BREAK, ...node.children.flatMap(sanitizeNode), LINE_BREAK]
+    case 'fn':
+      if (node.props.name === 'ruby') return rubyBase(node)
+      return node.children.flatMap(sanitizeNode)
+    // bold, small, italic, strike, link(表示テキスト)
+    default:
+      return node.children.flatMap(sanitizeNode)
   }
 }
 
-export function sanitize(nodes: Array<mfm.MfmNode>): Array<mfm.MfmNode> {
-  return nodes.map(n => sanitizeLoop(n)).flat()
+export function sanitize(nodes: Array<mfm.MfmNode>): Array<SanitizedNode> {
+  return nodes.flatMap(sanitizeNode)
 }
 
 export type EmiToken = {
@@ -72,6 +88,16 @@ const EOS_TOKEN: EmiToken = { surface: 'EOS', feature: { pos: 'BOS/EOS' }, id: u
 const isBoundary = (t: EmiToken) => t.feature.pos === 'BOS/EOS'
 const isBOS = (t: EmiToken) => isBoundary(t) && t.surface === 'BOS'
 const isEOS = (t: EmiToken) => isBoundary(t) && t.surface === 'EOS'
+const GAP_TOKEN: EmiToken = { surface: 'GAP', feature: { pos: 'GAP' }, id: undefined }
+const isGap = (t: EmiToken) => t.feature.pos === 'GAP'
+
+// 行頭・行末のGAPと連続するGAPを取り除く
+function trimGaps(line: Array<EmiToken>): Array<EmiToken> {
+  const result = line.filter((t, i) => !isGap(t) || (i > 0 && !isGap(line[i - 1])))
+  while (result.length > 0 && isGap(result[0])) result.shift()
+  while (result.length > 0 && isGap(result[result.length - 1])) result.pop()
+  return result
+}
 
 function mecab(text: string): Array<EmiToken> {
   let options = {}
@@ -83,7 +109,8 @@ function mecab(text: string): Array<EmiToken> {
 
 // 改行ごとに BOS ... EOS で囲んだトークン列を返す
 // MFMノードの境界では文を区切らず、連続するテキストはまとめて解析する
-export function tokenize(nodes: Array<mfm.MfmNode>): Array<EmiToken> {
+// 除去された要素の位置には GAP トークンが入る
+export function tokenize(nodes: Array<SanitizedNode>): Array<EmiToken> {
   const lines: Array<Array<EmiToken>> = [[]]
   let buffer = ''
   const flush = () => {
@@ -106,11 +133,14 @@ export function tokenize(nodes: Array<mfm.MfmNode>): Array<EmiToken> {
     } else if (node.type == 'emojiCode') {
       flush()
       lines[lines.length - 1].push({ surface: `:${node.props.name}:`, feature: { pos: '絵文字' }, id: undefined })
+    } else if (node.type == 'gap') {
+      flush()
+      lines[lines.length - 1].push(GAP_TOKEN)
     }
   }
   flush()
 
-  return lines.filter(line => line.length > 0).flatMap(line => [BOS_TOKEN, ...line, EOS_TOKEN])
+  return lines.map(trimGaps).filter(line => line.length > 0).flatMap(line => [BOS_TOKEN, ...line, EOS_TOKEN])
 }
 
 // BOS ... EOS 単位に分割する
@@ -151,7 +181,10 @@ export class NgramModel {
   addSentence(sentence: Array<EmiToken>) {
     for (let i = 1; i < sentence.length; i++) {
       const next = sentence[i]
+      if (isGap(next)) continue
       for (let n = 1; n <= this.maxOrder && i - n >= 0; n++) {
+        // GAPをまたぐ文脈は学習しない(これより長い文脈も同様)
+        if (isGap(sentence[i - n])) break
         const key = contextKey(sentence.slice(i - n, i))
         let candidates = this.table.get(key)
         if (!candidates) {
