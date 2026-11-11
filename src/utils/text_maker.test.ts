@@ -36,6 +36,14 @@ describe('text_maker', () => {
       const bos = tokens.find(t => t.surface === 'BOS');
       expect(bos).toBeDefined();
     });
+
+    it('should tokenize with a valid dictionary', () => {
+      // 辞書が読み込めないと "[ifs]" のような異常トークンになるため、形態素解析結果を確認する
+      const nodes: mfm.MfmNode[] = [{ type: 'text', props: { text: '猫と遊んだ' } }];
+      const tokens = tokenize(nodes).filter(t => t.feature.pos !== 'BOS/EOS');
+      expect(tokens.map(t => t.surface)).toEqual(['猫', 'と', '遊ん', 'だ']);
+      expect(tokens.map(t => t.feature.pos)).toEqual(['名詞', '助詞', '動詞', '助動詞']);
+    });
   });
 
   describe('createTextFromInputs', () => {
